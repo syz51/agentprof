@@ -279,7 +279,8 @@ By default, outputs contain no message text, tool input or tool output.
 
 - Titles appear only with `--include-titles`.
 - Commands are reduced to a hash and the program name.
-- File paths appear in `file-reread` findings, with the home directory shown as `~`.
+- File paths appear in `file-reread` findings and as evidence. Every path the tool writes shows the home directory as `~`, and so does any other `/Users/<name>` or `/home/<name>` prefix.
+- A program name is the first word of the command after `NAME=value` assignments and `env` with its options, with shell quoting removed. Anything that is not a plain program name, such as a word containing `=`, becomes `unknown`, so an inline secret never reaches a finding.
 
 ## Limitations
 

@@ -50,12 +50,23 @@ pub fn display_path(p: &Path) -> String {
     tilde(&s)
 }
 
+/// Privacy rule for every path the tool writes: the current home directory,
+/// and any `/Users/<name>` or `/home/<name>` prefix (another account's home,
+/// or the same home seen from another machine), becomes `~`.
 pub fn tilde(s: &str) -> String {
     if let Some(home) = std::env::var_os("HOME") {
         let home = home.to_string_lossy();
         let home = home.trim_end_matches('/');
         if !home.is_empty() && within(s, home) {
             return format!("~{}", &s[home.len()..]);
+        }
+    }
+    for base in ["/Users/", "/home/"] {
+        if let Some(rest) = s.strip_prefix(base) {
+            let (name, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            if !name.is_empty() {
+                return format!("~{tail}");
+            }
         }
     }
     s.to_string()
@@ -85,19 +96,119 @@ pub fn fnv64(s: &str) -> String {
     format!("{h:016x}")
 }
 
-/// First word of a shell command, as a basename; safe to print.
-pub fn program_name(cmd: &str) -> String {
-    let mut words = cmd.split_whitespace();
-    let mut w = words.next().unwrap_or("");
-    // Skip leading environment assignments such as `FOO=1 cmd`.
-    while w.contains('=') && !w.starts_with('=') {
-        match words.next() {
-            Some(n) => w = n,
-            None => break,
+/// A shell word with quoting removed, and whether it is a `NAME=value`
+/// assignment (an unquoted valid name before an unquoted `=`).
+struct Word {
+    text: String,
+    assignment: bool,
+}
+
+/// Words of the first simple command in `cmd`, with shell quoting and
+/// backslash escapes removed. Stops at an unquoted `;`, `|`, `&` or newline.
+fn first_command_words(cmd: &str) -> Vec<Word> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    // Still a candidate assignment name: no quoting or escape seen yet.
+    let mut name_plain = true;
+    let mut assignment = false;
+    let mut in_word = false;
+    let mut chars = cmd.chars();
+    let (mut single, mut double) = (false, false);
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => {
+                single = !single;
+                in_word = true;
+                name_plain &= assignment;
+            }
+            '"' if !single => {
+                double = !double;
+                in_word = true;
+                name_plain &= assignment;
+            }
+            '\\' if !single => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+                in_word = true;
+                name_plain &= assignment;
+            }
+            c if single || double => cur.push(c),
+            ';' | '|' | '&' | '\n' => break,
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(Word {
+                        text: std::mem::take(&mut cur),
+                        assignment,
+                    });
+                    in_word = false;
+                    name_plain = true;
+                    assignment = false;
+                }
+            }
+            c => {
+                if c == '=' && !assignment && name_plain && is_name(&cur) {
+                    assignment = true;
+                }
+                cur.push(c);
+                in_word = true;
+            }
         }
     }
-    let w = w.trim_matches(|c| c == '"' || c == '\'' || c == '(');
-    w.rsplit('/').next().unwrap_or(w).to_string()
+    if in_word {
+        words.push(Word {
+            text: cur,
+            assignment,
+        });
+    }
+    words
+}
+
+/// A valid shell variable name.
+fn is_name(s: &str) -> bool {
+    let mut ch = s.chars();
+    ch.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && ch.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The program a shell command runs, as a basename; safe to print. Leading
+/// `NAME=value` assignments and `env` with its options are skipped. Anything
+/// that is not a plain program name (it contains `=`, a quote or other
+/// unusual characters, which may be a secret) becomes `unknown`.
+pub fn program_name(cmd: &str) -> String {
+    let words = first_command_words(cmd);
+    let mut it = words.iter().peekable();
+    while it.peek().is_some_and(|w| w.assignment) {
+        it.next();
+    }
+    if it.peek().is_some_and(|w| w.text == "env") {
+        it.next();
+        while let Some(w) = it.peek() {
+            if w.text == "-u" || w.text == "--unset" {
+                it.next();
+                it.next();
+            } else if w.text.starts_with('-') || w.assignment {
+                it.next();
+            } else {
+                break;
+            }
+        }
+    }
+    let w = it
+        .next()
+        .map_or("", |w| w.text.as_str())
+        .trim_start_matches('(');
+    let name = w.rsplit('/').next().unwrap_or(w);
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'));
+    if plain {
+        name.to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 /// True when a shell command sleeps or waits for something to change.
@@ -129,6 +240,40 @@ mod tests {
             Some("h.example")
         );
         assert_eq!(host_of("not a url"), None);
+    }
+
+    #[test]
+    fn home_prefixes_of_any_account_become_tilde() {
+        assert_eq!(tilde("/Users/someone/p/q.jsonl"), "~/p/q.jsonl");
+        assert_eq!(tilde("/home/someone"), "~");
+        assert_eq!(tilde("/home/someone/x"), "~/x");
+        assert_eq!(tilde("/Users/"), "/Users/");
+        assert_eq!(tilde("/opt/Users/x"), "/opt/Users/x");
+        assert_eq!(tilde("/work/p"), "/work/p");
+    }
+
+    #[test]
+    fn program_names_never_carry_assignments() {
+        let fake = "sk-FAKESECRET2";
+        let cases = [
+            (format!("OPENAI_API_KEY={fake} codex exec x"), "codex"),
+            (
+                format!("OPENAI_API_KEY='{fake} b' A=1 /usr/bin/bun run"),
+                "bun",
+            ),
+            (format!("env -u HOME OPENAI_API_KEY={fake} -- ls"), "ls"),
+            (format!("env -i OPENAI_API_KEY={fake} ls -la"), "ls"),
+            (format!("OPENAI_API_KEY={fake}"), "unknown"),
+            (format!("\"OPENAI_API_KEY={fake}\" ls"), "unknown"),
+            (format!("OPENAI_API_KEY=\"{fake} \\\" x\" git log"), "git"),
+            (format!("(cd /x && OPENAI_API_KEY={fake} make)"), "cd"),
+            (format!("X={fake}; curl x"), "unknown"),
+        ];
+        for (cmd, want) in &cases {
+            let got = program_name(cmd);
+            assert_eq!(got, *want, "{cmd}");
+            assert!(!got.contains("FAKESECRET") && !got.contains('='));
+        }
     }
 
     #[test]
