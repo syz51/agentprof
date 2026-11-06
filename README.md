@@ -88,7 +88,9 @@ Renders a Markdown summary of a scan directory. It covers:
 - Findings by rule.
 - Coverage and cross-checks.
 
-Every cost is labelled an API-equivalent estimate.
+Every cost is labelled an API-equivalent estimate. Time and turn sums skip sessions where the value is unknown and say how many, for example `6 (1 unknown)`.
+
+`report` reads only schema major version 1 (`rf.session/1`, `rf.finding/1`, `agentprof.scan/1`, or a later minor such as `rf.session/1.1`); any other version is an error naming the file and line. When stdout is closed early (for example `| head`), it stops quietly with exit code 0.
 
 ### Exit codes
 

@@ -58,16 +58,31 @@ fn main() -> ExitCode {
             match out {
                 Some(p) => std::fs::write(&p, md)
                     .map_err(|e| anyhow::anyhow!("writing {}: {e}", p.display()))?,
-                None => print!("{md}"),
+                None => {
+                    use std::io::Write as _;
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(md.as_bytes())?;
+                    out.flush()?;
+                }
             }
             Ok(0)
         }),
     };
     match result {
         Ok(code) => ExitCode::from(code),
+        // The reader closed stdout (e.g. `| head`): stop quietly. Scan
+        // outputs are written to files before anything goes to stdout.
+        Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("agentprof: {e:#}");
             ExitCode::from(2)
         }
     }
+}
+
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
 }

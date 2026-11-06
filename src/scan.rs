@@ -276,6 +276,8 @@ fn inflation(naive: &Tokens, dedup: &Tokens) -> Inflation {
     }
 }
 
+pub const SCAN_SCHEMA: &str = "agentprof.scan/1";
+
 pub struct Outcome {
     pub errors: usize,
 }
@@ -894,7 +896,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
     write_jsonl(&inp.out.join("findings.jsonl"), &findings)?;
     let errors = findings.iter().filter(|f| f.severity == "error").count();
     let scan = json!({
-        "schema": "agentprof.scan/1",
+        "schema": SCAN_SCHEMA,
         "tool": "agentprof",
         "version": env!("CARGO_PKG_VERSION"),
         "generated_at": at,
@@ -932,7 +934,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
     match a.format {
         Format::Jsonl => {
             for fd in &findings {
-                serde_json::to_writer(&mut out, fd)?;
+                serde_json::to_writer(&mut out, fd).map_err(std::io::Error::from)?;
                 out.write_all(b"\n")?;
             }
         }

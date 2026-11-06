@@ -4,22 +4,46 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::detect::{Finding, is_blocked_status, is_failed_status};
 use crate::session::{Acc, Session, ToolStat};
 
-fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+/// Checks a record's `schema` against `expected` (`name/major`): the name
+/// must match and the major version must be the one this build reads; a
+/// later minor version (`name/1.2`) only adds fields and is accepted.
+fn check_schema(found: Option<&str>, expected: &str) -> Result<()> {
+    let (name, major) = expected.split_once('/').expect("name/major");
+    let ok = found
+        .and_then(|f| f.split_once('/'))
+        .is_some_and(|(n, v)| n == name && v.split('.').next() == Some(major));
+    if !ok {
+        bail!(
+            "schema {} is not supported; this build reads {expected}",
+            found.unwrap_or("(none)")
+        );
+    }
+    Ok(())
+}
+
+fn read_jsonl<T: DeserializeOwned>(path: &Path, schema: &str) -> Result<Vec<T>> {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        schema: Option<String>,
+    }
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     text.lines()
         .enumerate()
         .filter(|(_, l)| !l.trim().is_empty())
         .map(|(i, l)| {
-            serde_json::from_str(l)
-                .with_context(|| format!("{}:{}: invalid record", path.display(), i + 1))
+            let at = || format!("{}:{}", path.display(), i + 1);
+            let head: Head =
+                serde_json::from_str(l).with_context(|| format!("{}: invalid record", at()))?;
+            check_schema(head.schema.as_deref(), schema).with_context(at)?;
+            serde_json::from_str(l).with_context(|| format!("{}: invalid record", at()))
         })
         .collect()
 }
@@ -94,6 +118,10 @@ struct Group {
     wall_ms: i64,
     active_ms: i64,
     turns: u64,
+    /// Sessions whose wall time, active time or turns are unknown (null).
+    wall_unknown: u64,
+    active_unknown: u64,
+    turns_unknown: u64,
 }
 
 impl Group {
@@ -103,9 +131,27 @@ impl Group {
             self.acc.merge(t);
             self.with_tokens += 1;
         }
-        self.wall_ms += s.wall_ms.unwrap_or(0);
-        self.active_ms += s.active_ms.unwrap_or(0);
-        self.turns += s.turns.unwrap_or(0);
+        match s.wall_ms {
+            Some(v) => self.wall_ms += v,
+            None => self.wall_unknown += 1,
+        }
+        match s.active_ms {
+            Some(v) => self.active_ms += v,
+            None => self.active_unknown += 1,
+        }
+        match s.turns {
+            Some(v) => self.turns += v,
+            None => self.turns_unknown += 1,
+        }
+    }
+}
+
+/// A sum over known values, noting how many sessions were unknown.
+fn known(sum: String, unknown: u64) -> String {
+    if unknown == 0 {
+        sum
+    } else {
+        format!("{sum} ({} unknown)", num(unknown))
     }
 }
 
@@ -114,13 +160,18 @@ fn session_tokens(s: &Session) -> u64 {
 }
 
 pub fn render(dir: &Path, top: usize) -> Result<String> {
-    let sessions: Vec<Session> = read_jsonl(&dir.join("sessions.jsonl"))?;
-    let findings: Vec<Finding> = read_jsonl(&dir.join("findings.jsonl"))?;
+    let sessions: Vec<Session> = read_jsonl(&dir.join("sessions.jsonl"), crate::session::SCHEMA)?;
+    let findings: Vec<Finding> =
+        read_jsonl(&dir.join("findings.jsonl"), crate::detect::FINDING_SCHEMA)?;
     let scan: Value = {
         let p = dir.join("scan.json");
         let text =
             std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?
+        let v: Value =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
+        check_schema(v["schema"].as_str(), crate::scan::SCAN_SCHEMA)
+            .with_context(|| p.display().to_string())?;
+        v
     };
     let mut o = String::new();
     let g = |path: &[&str]| -> Value {
@@ -187,9 +238,9 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
             "| {src} | {} | {} | {} | {} | {} | {} |",
             num(gr.sessions),
             num(gr.with_tokens),
-            num(gr.turns),
-            hours(gr.wall_ms),
-            hours(gr.active_ms),
+            known(num(gr.turns), gr.turns_unknown),
+            known(hours(gr.wall_ms), gr.wall_unknown),
+            known(hours(gr.active_ms), gr.active_unknown),
             union.map(hours).unwrap_or_else(|| "–".into())
         );
     }

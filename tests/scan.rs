@@ -508,3 +508,70 @@ fn titles_only_with_flag_and_usage_errors_exit_2() {
         .unwrap();
     assert_eq!(missing.status.code(), Some(2));
 }
+
+fn scan(root: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_agentprof"))
+        .current_dir(root)
+        .arg("scan")
+        .args(args)
+        .args(["--timezone", "UTC", "--billing-log", "/nonexistent/c.jsonl"])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn report_rejects_other_schema_majors_and_survives_a_closed_pipe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let claude = claude_tree(root);
+    let out = root.join("out");
+    let res = scan(
+        root,
+        &[
+            "--project",
+            "/work/proj",
+            "--out",
+            out.to_str().unwrap(),
+            "--claude-dir",
+            claude.to_str().unwrap(),
+            "--codex-db",
+            "/nonexistent/a.sqlite",
+            "--t3-db",
+            "/nonexistent/b.sqlite",
+        ],
+    );
+    assert_eq!(res.status.code(), Some(0));
+    let bin = env!("CARGO_BIN_EXE_agentprof");
+
+    // stdout whose reader is already gone.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let st = Command::new(bin)
+        .arg("report")
+        .arg(&out)
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(st.status.code(), Some(0));
+    assert!(
+        st.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    // A later minor version is read; another major is refused.
+    let path = out.join("sessions.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replacen("rf.session/1", "rf.session/1.1", 1)).unwrap();
+    let ok = Command::new(bin).arg("report").arg(&out).output().unwrap();
+    assert_eq!(ok.status.code(), Some(0));
+    std::fs::write(&path, text.replacen("rf.session/1", "rf.session/2", 1)).unwrap();
+    let bad = Command::new(bin).arg("report").arg(&out).output().unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        err.contains("sessions.jsonl:1") && err.contains("rf.session/2"),
+        "{err}"
+    );
+}
