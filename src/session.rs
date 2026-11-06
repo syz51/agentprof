@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pricing::RequestCost;
+
 pub const SCHEMA: &str = "rf.session/1";
 
 /// Token counts in disjoint classes: `input`, the three cache-write classes,
@@ -61,14 +63,27 @@ pub struct Acc {
     /// Requests whose cost could not be established; their tokens are in
     /// `tokens` but not in `priced_usd`.
     pub unpriced_requests: u64,
+    /// Priced requests whose prompt was over the model's long-context
+    /// threshold, and what that tier added over the standard rates (USD,
+    /// included in `priced_usd`).
+    #[serde(default)]
+    pub long_context_requests: u64,
+    #[serde(default)]
+    pub long_context_usd: f64,
 }
 
 impl Acc {
-    pub fn add_request(&mut self, t: &Tokens, usd: Option<f64>) {
+    pub fn add_request(&mut self, t: &Tokens, cost: Option<RequestCost>) {
         self.requests += 1;
         self.tokens.add(t);
-        match usd {
-            Some(u) => self.priced_usd += u,
+        match cost {
+            Some(c) => {
+                self.priced_usd += c.usd;
+                if c.long_context {
+                    self.long_context_requests += 1;
+                    self.long_context_usd += c.long_context_usd;
+                }
+            }
             None => self.unpriced_requests += 1,
         }
     }
@@ -78,6 +93,8 @@ impl Acc {
         self.tokens.add(&o.tokens);
         self.priced_usd += o.priced_usd;
         self.unpriced_requests += o.unpriced_requests;
+        self.long_context_requests += o.long_context_requests;
+        self.long_context_usd += o.long_context_usd;
     }
 
     /// Full cost when every request was priced, otherwise unknown.
@@ -363,12 +380,27 @@ mod tests {
             output: 5,
             ..Tokens::default()
         };
+        let one = RequestCost {
+            usd: 1.0,
+            long_context: false,
+            long_context_usd: 0.0,
+        };
         let mut a = Acc::default();
-        a.add_request(&t, Some(1.0));
+        a.add_request(&t, Some(one));
         assert_eq!(a.usd(), Some(1.0));
         a.add_request(&t, None);
         assert_eq!(a.usd(), None);
         assert_eq!(a.priced_usd, 1.0);
         assert_eq!(a.tokens.total(), 30);
+        let long = RequestCost {
+            usd: 2.0,
+            long_context: true,
+            long_context_usd: 0.5,
+        };
+        a.add_request(&t, Some(long));
+        let mut b = Acc::default();
+        b.merge(&a);
+        assert_eq!((b.long_context_requests, b.long_context_usd), (1, 0.5));
+        assert_eq!(b.priced_usd, 3.0);
     }
 }

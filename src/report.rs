@@ -269,6 +269,54 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
         let _ = writeln!(o);
     }
 
+    // ---- Long-context pricing.
+    let mut lc: BTreeMap<(String, String), Acc> = BTreeMap::new();
+    for s in sessions.iter().filter(|s| s.source != "t3") {
+        for (k, a) in &s.by_model {
+            lc.entry((s.source.clone(), k.clone()))
+                .or_default()
+                .merge(a);
+        }
+    }
+    let mut lc_total = Acc::default();
+    let _ = writeln!(o, "## Long-context pricing\n");
+    let _ = writeln!(
+        o,
+        "Requests whose prompt exceeded the model's long-context threshold in `pricing.toml` are priced at that tier. The surcharge is the tier's cost minus the same tokens at standard rates; it is included in every cost above.\n"
+    );
+    let _ = writeln!(
+        o,
+        "| Source / model | Priced requests | Over the threshold | Share | Surcharge | Cost |\n|---|---:|---:|---:|---:|---:|"
+    );
+    for ((src, model), a) in lc.iter().filter(|(_, a)| a.long_context_requests > 0) {
+        let priced = a.requests - a.unpriced_requests;
+        let _ = writeln!(
+            o,
+            "| {src} / {model} | {} | {} | {} | ${:.2} | {} |",
+            num(priced),
+            num(a.long_context_requests),
+            pct(a.long_context_requests, priced),
+            a.long_context_usd,
+            usd(a)
+        );
+        lc_total.merge(a);
+    }
+    if lc_total.long_context_requests == 0 {
+        let _ = writeln!(o, "| none | – | 0 | – | $0.00 | – |");
+    } else {
+        let priced = lc_total.requests - lc_total.unpriced_requests;
+        let _ = writeln!(
+            o,
+            "| **all models above** | {} | {} | {} | ${:.2} | {} |",
+            num(priced),
+            num(lc_total.long_context_requests),
+            pct(lc_total.long_context_requests, priced),
+            lc_total.long_context_usd,
+            usd(&lc_total)
+        );
+    }
+    let _ = writeln!(o);
+
     // ---- Billing mode.
     let _ = writeln!(o, "## Billing mode\n");
     let _ = writeln!(

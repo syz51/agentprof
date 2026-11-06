@@ -166,7 +166,7 @@ One JSON object per line. The fields:
 | `t3` | object or null | T3 threads only. `project_id`, `provider`, `runs_by_status`, `runs_by_model`, `runs_by_effort`, `runs_by_provider` (the run's own provider, then status), `archived`, `deleted`, `linked` (`<source>:<id>`), `link_basis`, `unresolved_links`. |
 | `notes` | array of string | Caveats specific to this session, such as an assumed service tier. |
 
-An **Acc** is `{requests, tokens, priced_usd, unpriced_requests}`.
+An **Acc** is `{requests, tokens, priced_usd, unpriced_requests, long_context_requests, long_context_usd}`. The last two count the priced requests whose prompt exceeded the model's long-context threshold, and what that tier added over the standard rates (already included in `priced_usd`).
 
 **Tokens** has seven fields:
 
@@ -239,6 +239,7 @@ T3 threads carry no tokens, so linking never adds tokens. `coverage.t3` reports 
 | `cache-churn` | warn | Cache writes / (writes + reads) is at least R, in a session with at least M prompt tokens. | `--cache-churn-ratio` (0.25) |
 | `frequent-compaction` | warn | At least N compactions. | `--compactions-min` (3) |
 | `near-context-window` | warn | A request's prompt is at least R × the context window. | `--context-ratio` (0.9) |
+| `long-context-tier` | warn | At least a share S of a session's priced requests had prompts over the model's long-context threshold (for example 272k tokens for gpt-6.1-sol), so they were priced at the higher tier. Reports the surcharge. | `--long-context-share` (0.1) |
 | `long-idle-gap` | info | No record for at least N minutes inside a session. | `--idle-gap-minutes` (30) |
 | `rate-limit-saturation` | warn | A usage window was at or above 100 %, a limit was reached, or a request was refused for a limit. | none |
 | `api-error` | warn | API errors other than usage limits. | none |

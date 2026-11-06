@@ -73,7 +73,9 @@ fn codex_tree(root: &Path) -> (PathBuf, PathBuf) {
             r#"{"timestamp":"2026-01-02T00:00:00Z","type":"event_msg","ordinal":2,"payload":{"type":"task_started","turn_id":"turn-1"}}"#.into(),
             token_count("2026-01-02T00:00:01Z", 3, (1000, 100), (1000, 100)),
             token_count("2026-01-02T00:00:02Z", 4, (3000, 300), (2000, 200)),
-            r#"{"timestamp":"2026-01-02T00:01:00Z","type":"event_msg","ordinal":5,"payload":{"type":"task_complete","turn_id":"turn-1","duration_ms":60000}}"#.into(),
+            // A 300k-token prompt: over gpt-6.1-terra's 272k long-context threshold.
+            token_count("2026-01-02T00:00:03Z", 5, (303_000, 1300), (300_000, 1000)),
+            r#"{"timestamp":"2026-01-02T00:01:00Z","type":"event_msg","ordinal":6,"payload":{"type":"task_complete","turn_id":"turn-1","duration_ms":60000}}"#.into(),
         ]
         .join("\n")
             + "\n",
@@ -116,7 +118,7 @@ fn codex_tree(root: &Path) -> (PathBuf, PathBuf) {
         )
         .unwrap();
     };
-    ins("t1", &r1, "vscode", "/work/proj", 3300);
+    ins("t1", &r1, "vscode", "/work/proj", 304_300);
     ins(
         "t2",
         &r2,
@@ -360,8 +362,12 @@ fn scan_and_report_end_to_end() {
     assert_eq!(sub["parent_id"], "s1");
 
     let t1 = session(&rows, "codex:t1");
-    assert_eq!(t1["total"]["tokens"]["input"], 3000);
-    assert_eq!(t1["total"]["tokens"]["output"], 300);
+    assert_eq!(t1["total"]["tokens"]["input"], 303_000);
+    assert_eq!(t1["total"]["tokens"]["output"], 1300);
+    // Only the 300k request is at the tier: 300k x ($2 - $1) + 1k x ($7.50 - $5) per million.
+    assert_eq!(t1["total"]["long_context_requests"], 1);
+    let lc = t1["total"]["long_context_usd"].as_f64().unwrap();
+    assert!((lc - 0.3025).abs() < 1e-9, "{lc}");
     assert_eq!(t1["active_ms"], 60000);
     assert_eq!(t1["t3_link"], "turn-ref");
     let t2 = session(&rows, "codex:t2");
@@ -400,6 +406,8 @@ fn scan_and_report_end_to_end() {
     assert!(has("t3-unlinked", "t3:T-e"));
     assert!(has("run-interrupted", "t3:T-b"));
     assert!(has("transcript-missing", "codex:t3"));
+    assert!(has("long-context-tier", "codex:t1"));
+    assert!(!has("long-context-tier", "codex:t2"));
 
     let scan: Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("scan.json")).unwrap()).unwrap();
@@ -431,6 +439,10 @@ fn scan_and_report_end_to_end() {
     let md = String::from_utf8(rep.stdout).unwrap();
     assert!(md.contains("API-equivalent estimate"));
     assert!(md.contains("## Findings by rule"));
+    assert!(
+        md.contains("| codex / gpt-6.1-terra | 6 | 1 | 16.7% | $0.30 |"),
+        "{md}"
+    );
     assert!(md.contains("run-failed"));
 
     // Privacy: no message text, tool output or titles anywhere in the outputs.

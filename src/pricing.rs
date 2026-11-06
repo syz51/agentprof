@@ -48,6 +48,44 @@ pub struct ServerTool {
     pub checked: String,
 }
 
+/// The API-equivalent cost of one request.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RequestCost {
+    pub usd: f64,
+    /// The request was priced at the model's long-context tier.
+    pub long_context: bool,
+    /// What the tier added over the standard rates; 0 below the threshold.
+    pub long_context_usd: f64,
+}
+
+/// Prices per million tokens for one tier; `None` marks an unpriced class.
+struct Rates {
+    input: f64,
+    cw5: Option<f64>,
+    cw1h: Option<f64>,
+    read: f64,
+    output: f64,
+}
+
+impl Rates {
+    fn cost(&self, t: &Tokens) -> Option<f64> {
+        let cw5 = if t.cache_write_5m > 0 { self.cw5? } else { 0.0 };
+        let cw1h = if t.cache_write_1h > 0 {
+            self.cw1h?
+        } else {
+            0.0
+        };
+        Some(
+            (t.input as f64 * self.input
+                + t.cache_write_5m as f64 * cw5
+                + t.cache_write_1h as f64 * cw1h
+                + t.cache_read as f64 * self.read
+                + t.output as f64 * self.output)
+                / 1_000_000.0,
+        )
+    }
+}
+
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Pricing {
@@ -108,37 +146,45 @@ impl Pricing {
     /// API-equivalent cost of one request, or `None` when it cannot be
     /// established: unknown model, a token class without a price, or cache
     /// writes of unknown TTL. `multiplier` applies documented surcharges such
-    /// as Anthropic's US-only inference (1.1).
-    pub fn request_cost(&self, model: &str, t: &Tokens, multiplier: f64) -> Option<f64> {
+    /// as Anthropic's US-only inference (1.1). The result also says how much
+    /// the long-context tier added: the cost at the tier minus the same tokens
+    /// at the standard rates. A request at or below the threshold, or a model
+    /// without a tier, adds nothing.
+    pub fn request_cost(&self, model: &str, t: &Tokens, multiplier: f64) -> Option<RequestCost> {
         let m = self.model(model)?;
         if t.cache_write_unknown > 0 {
             return None;
         }
-        let (input, cw5, cw1h, read, output) = match &m.long_context {
-            Some(lc) if t.prompt() > lc.threshold_tokens => (
-                lc.input,
-                lc.cache_write_5m,
-                lc.cache_write_1h,
-                lc.cache_read,
-                lc.output,
-            ),
-            _ => (
-                m.input,
-                m.cache_write_5m,
-                m.cache_write_1h,
-                m.cache_read,
-                m.output,
-            ),
+        let standard = Rates {
+            input: m.input,
+            cw5: m.cache_write_5m,
+            cw1h: m.cache_write_1h,
+            read: m.cache_read,
+            output: m.output,
         };
-        let cw5 = if t.cache_write_5m > 0 { cw5? } else { 0.0 };
-        let cw1h = if t.cache_write_1h > 0 { cw1h? } else { 0.0 };
-        let usd = (t.input as f64 * input
-            + t.cache_write_5m as f64 * cw5
-            + t.cache_write_1h as f64 * cw1h
-            + t.cache_read as f64 * read
-            + t.output as f64 * output)
-            / 1_000_000.0;
-        Some(usd * multiplier)
+        let base = standard.cost(t)? * multiplier;
+        match &m.long_context {
+            Some(lc) if t.prompt() > lc.threshold_tokens => {
+                let tier = Rates {
+                    input: lc.input,
+                    cw5: lc.cache_write_5m,
+                    cw1h: lc.cache_write_1h,
+                    read: lc.cache_read,
+                    output: lc.output,
+                };
+                let usd = tier.cost(t)? * multiplier;
+                Some(RequestCost {
+                    usd,
+                    long_context: true,
+                    long_context_usd: usd - base,
+                })
+            }
+            _ => Some(RequestCost {
+                usd: base,
+                long_context: false,
+                long_context_usd: 0.0,
+            }),
+        }
     }
 
     /// One-line description of the prices used, for cost `basis` fields.
@@ -183,9 +229,19 @@ mod tests {
             output: 1_000_000,
             ..Tokens::default()
         };
-        let c = p.request_cost("claude-opus-5-5", &t, 1.0).unwrap();
+        let c = p
+            .request_cost("claude-opus-5-5", &t, 1.0)
+            .map(|c| c.usd)
+            .unwrap();
         assert!((c - (4.0 + 5.0 + 8.0 + 0.2 + 20.0)).abs() < 1e-9);
-        assert!((p.request_cost("claude-opus-5-5", &t, 1.1).unwrap() - c * 1.1).abs() < 1e-9);
+        assert!(
+            (p.request_cost("claude-opus-5-5", &t, 1.1)
+                .map(|c| c.usd)
+                .unwrap()
+                - c * 1.1)
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]
@@ -198,9 +254,46 @@ mod tests {
             output: 1_000,
             ..Tokens::default()
         };
-        let c = p.request_cost("claude-haiku-5-5", &t, 1.0).unwrap();
+        let c = p
+            .request_cost("claude-haiku-5-5", &t, 1.0)
+            .map(|c| c.usd)
+            .unwrap();
         let expect = (60_000.0 * 0.5 + 50_000.0 * 0.05 + 1_000.0 * 2.5) / 1e6;
         assert!((c - expect).abs() < 1e-12);
+    }
+
+    #[test]
+    fn long_context_surcharge_is_tier_minus_standard() {
+        let p = Pricing::load(None).unwrap();
+        // 2k uncached + 300k cached = 302k prompt: over gpt-6.1-sol's 272k threshold.
+        let t = Tokens {
+            input: 2_000,
+            cache_read: 300_000,
+            output: 1_000,
+            ..Tokens::default()
+        };
+        let c = p.request_cost("gpt-6.1-sol", &t, 1.0).unwrap();
+        let tier = (2_000.0 * 4.0 + 300_000.0 * 0.2 + 1_000.0 * 15.0) / 1e6;
+        let standard = (2_000.0 * 2.0 + 300_000.0 * 0.1 + 1_000.0 * 10.0) / 1e6;
+        assert!(c.long_context);
+        assert!((c.usd - tier).abs() < 1e-12);
+        assert!((c.long_context_usd - (tier - standard)).abs() < 1e-12);
+        // At the threshold itself the standard rates apply.
+        let at = Tokens {
+            input: 0,
+            cache_read: 272_000,
+            ..Tokens::default()
+        };
+        let c = p.request_cost("gpt-6.1-sol", &at, 1.0).unwrap();
+        assert!(!c.long_context);
+        assert_eq!(c.long_context_usd, 0.0);
+        // A model without a tier never adds a surcharge.
+        let big = Tokens {
+            cache_read: 900_000,
+            ..Tokens::default()
+        };
+        let c = p.request_cost("claude-opus-5-5", &big, 1.0).unwrap();
+        assert!(!c.long_context);
     }
 
     #[test]
@@ -210,18 +303,21 @@ mod tests {
             input: 1,
             ..Tokens::default()
         };
-        assert_eq!(p.request_cost("gpt-unknown", &t, 1.0), None);
+        assert_eq!(p.request_cost("gpt-unknown", &t, 1.0).map(|c| c.usd), None);
         let w = Tokens {
             cache_write_5m: 1,
             ..Tokens::default()
         };
         // OpenAI rows carry no 5-minute cache-write price.
-        assert_eq!(p.request_cost("gpt-6.1-sol", &w, 1.0), None);
+        assert_eq!(p.request_cost("gpt-6.1-sol", &w, 1.0).map(|c| c.usd), None);
         let u = Tokens {
             cache_write_unknown: 1,
             ..Tokens::default()
         };
-        assert_eq!(p.request_cost("claude-opus-5-5", &u, 1.0), None);
+        assert_eq!(
+            p.request_cost("claude-opus-5-5", &u, 1.0).map(|c| c.usd),
+            None
+        );
     }
 
     #[test]

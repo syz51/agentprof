@@ -15,7 +15,7 @@ use serde_json::Value;
 use serde_json::value::RawValue;
 
 use crate::detect::Trace;
-use crate::pricing::Pricing;
+use crate::pricing::{Pricing, RequestCost};
 use crate::session::{Acc, Session, Spawn, Tokens, ToolStat, Transcript};
 use crate::util::{day, display_path, host_of, parse_ts, tilde};
 
@@ -794,10 +794,14 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
             search_price.map(|p| p * searches as f64)
         };
         let usd = match (multiplier, standard, search_usd) {
-            (Some(m), true, Some(su)) => cx
-                .pricing
-                .request_cost(&rq.model, &rq.tokens, m)
-                .map(|c| c + su),
+            (Some(m), true, Some(su)) => {
+                cx.pricing
+                    .request_cost(&rq.model, &rq.tokens, m)
+                    .map(|c| RequestCost {
+                        usd: c.usd + su,
+                        ..c
+                    })
+            }
             _ => None,
         };
         if usd.is_some() {

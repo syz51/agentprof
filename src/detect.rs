@@ -42,6 +42,9 @@ pub struct Thresholds {
     /// near-context-window: prompt tokens / context window of one request
     #[arg(long, default_value_t = 0.9)]
     pub context_ratio: f64,
+    /// long-context-tier: share of a session's priced requests billed at the long-context tier
+    #[arg(long, default_value_t = 0.1)]
+    pub long_context_share: f64,
     /// long-idle-gap: minutes without any record inside a session
     #[arg(long, default_value_t = 30)]
     pub idle_gap_minutes: u64,
@@ -63,6 +66,7 @@ impl Default for Thresholds {
             cache_churn_ratio: 0.25,
             compactions_min: 3,
             context_ratio: 0.9,
+            long_context_share: 0.1,
             idle_gap_minutes: 30,
             fanout_min: 5,
         }
@@ -421,6 +425,28 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
             ),
             ev(t, *line),
             json!({"requests": t.near_context.len(), "max_prompt_tokens": p, "context_window": w}),
+        ));
+    }
+
+    // long-context-tier
+    if let Some(total) = &s.total
+        && total.long_context_requests > 0
+        && total.long_context_requests as f64
+            >= th.long_context_share * (total.requests - total.unpriced_requests) as f64
+    {
+        let lc = total.long_context_requests;
+        let priced = total.requests - total.unpriced_requests;
+        out.push(cx.finding(
+            "long-context-tier",
+            "warn",
+            &subject,
+            format!(
+                "{lc} of {priced} priced request(s) ({:.1}%) had prompts over the long-context threshold; the tier added ${:.2} over standard rates",
+                100.0 * lc as f64 / priced as f64,
+                total.long_context_usd
+            ),
+            Vec::new(),
+            json!({"long_context_requests": lc, "priced_requests": priced, "long_context_usd": total.long_context_usd}),
         ));
     }
 
