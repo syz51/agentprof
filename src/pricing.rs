@@ -150,7 +150,18 @@ impl Pricing {
     /// the long-context tier added: the cost at the tier minus the same tokens
     /// at the standard rates. A request at or below the threshold, or a model
     /// without a tier, adds nothing.
-    pub fn request_cost(&self, model: &str, t: &Tokens, multiplier: f64) -> Option<RequestCost> {
+    ///
+    /// `prompt_tokens` is the size of the request's own prompt, which picks
+    /// the tier. It is passed separately because a Codex counter increment
+    /// can cover several requests whose summed prompts say nothing about any
+    /// one of them.
+    pub fn request_cost(
+        &self,
+        model: &str,
+        t: &Tokens,
+        prompt_tokens: u64,
+        multiplier: f64,
+    ) -> Option<RequestCost> {
         let m = self.model(model)?;
         if t.cache_write_unknown > 0 {
             return None;
@@ -164,7 +175,7 @@ impl Pricing {
         };
         let base = standard.cost(t)? * multiplier;
         match &m.long_context {
-            Some(lc) if t.prompt() > lc.threshold_tokens => {
+            Some(lc) if prompt_tokens > lc.threshold_tokens => {
                 let tier = Rates {
                     input: lc.input,
                     cw5: lc.cache_write_5m,
@@ -230,12 +241,12 @@ mod tests {
             ..Tokens::default()
         };
         let c = p
-            .request_cost("claude-opus-5-5", &t, 1.0)
+            .request_cost("claude-opus-5-5", &t, t.prompt(), 1.0)
             .map(|c| c.usd)
             .unwrap();
         assert!((c - (4.0 + 5.0 + 8.0 + 0.2 + 20.0)).abs() < 1e-9);
         assert!(
-            (p.request_cost("claude-opus-5-5", &t, 1.1)
+            (p.request_cost("claude-opus-5-5", &t, t.prompt(), 1.1)
                 .map(|c| c.usd)
                 .unwrap()
                 - c * 1.1)
@@ -255,7 +266,7 @@ mod tests {
             ..Tokens::default()
         };
         let c = p
-            .request_cost("claude-haiku-5-5", &t, 1.0)
+            .request_cost("claude-haiku-5-5", &t, t.prompt(), 1.0)
             .map(|c| c.usd)
             .unwrap();
         let expect = (60_000.0 * 0.5 + 50_000.0 * 0.05 + 1_000.0 * 2.5) / 1e6;
@@ -272,7 +283,7 @@ mod tests {
             output: 1_000,
             ..Tokens::default()
         };
-        let c = p.request_cost("gpt-6.1-sol", &t, 1.0).unwrap();
+        let c = p.request_cost("gpt-6.1-sol", &t, t.prompt(), 1.0).unwrap();
         let tier = (2_000.0 * 4.0 + 300_000.0 * 0.2 + 1_000.0 * 15.0) / 1e6;
         let standard = (2_000.0 * 2.0 + 300_000.0 * 0.1 + 1_000.0 * 10.0) / 1e6;
         assert!(c.long_context);
@@ -284,7 +295,9 @@ mod tests {
             cache_read: 272_000,
             ..Tokens::default()
         };
-        let c = p.request_cost("gpt-6.1-sol", &at, 1.0).unwrap();
+        let c = p
+            .request_cost("gpt-6.1-sol", &at, at.prompt(), 1.0)
+            .unwrap();
         assert!(!c.long_context);
         assert_eq!(c.long_context_usd, 0.0);
         // A model without a tier never adds a surcharge.
@@ -292,8 +305,30 @@ mod tests {
             cache_read: 900_000,
             ..Tokens::default()
         };
-        let c = p.request_cost("claude-opus-5-5", &big, 1.0).unwrap();
+        let c = p
+            .request_cost("claude-opus-5-5", &big, big.prompt(), 1.0)
+            .unwrap();
         assert!(!c.long_context);
+    }
+
+    #[test]
+    fn tier_follows_the_requests_own_prompt() {
+        let p = Pricing::load(None).unwrap();
+        // Two requests of 150k prompt tokens each, merged into one increment:
+        // their sum (300k) is over the 272k threshold, but neither request is.
+        let merged = Tokens {
+            cache_read: 300_000,
+            ..Tokens::default()
+        };
+        let c = p
+            .request_cost("gpt-6.1-sol", &merged, 150_000, 1.0)
+            .unwrap();
+        assert!(!c.long_context);
+        assert!((c.usd - 300_000.0 * 0.1 / 1e6).abs() < 1e-12);
+        let c = p
+            .request_cost("gpt-6.1-sol", &merged, 280_000, 1.0)
+            .unwrap();
+        assert!(c.long_context);
     }
 
     #[test]
@@ -303,19 +338,28 @@ mod tests {
             input: 1,
             ..Tokens::default()
         };
-        assert_eq!(p.request_cost("gpt-unknown", &t, 1.0).map(|c| c.usd), None);
+        assert_eq!(
+            p.request_cost("gpt-unknown", &t, t.prompt(), 1.0)
+                .map(|c| c.usd),
+            None
+        );
         let w = Tokens {
             cache_write_5m: 1,
             ..Tokens::default()
         };
         // OpenAI rows carry no 5-minute cache-write price.
-        assert_eq!(p.request_cost("gpt-6.1-sol", &w, 1.0).map(|c| c.usd), None);
+        assert_eq!(
+            p.request_cost("gpt-6.1-sol", &w, w.prompt(), 1.0)
+                .map(|c| c.usd),
+            None
+        );
         let u = Tokens {
             cache_write_unknown: 1,
             ..Tokens::default()
         };
         assert_eq!(
-            p.request_cost("claude-opus-5-5", &u, 1.0).map(|c| c.usd),
+            p.request_cost("claude-opus-5-5", &u, u.prompt(), 1.0)
+                .map(|c| c.usd),
             None
         );
     }

@@ -321,6 +321,8 @@ fn scan_and_report_end_to_end() {
         .arg(&codex_db)
         .arg("--codex-archive")
         .arg(&archive)
+        .arg("--codex-sessions")
+        .arg(root.join("codex/sessions"))
         .arg("--t3-db")
         .arg(&t3)
         .arg("--billing-log")
@@ -360,6 +362,14 @@ fn scan_and_report_end_to_end() {
     let sub = session(&rows, "claude:s1/agent-a7");
     assert_eq!(sub["role"], "subagent");
     assert_eq!(sub["parent_id"], "s1");
+    // A subagent runs under its session's billing route.
+    assert_eq!(sub["billing"]["mode"], "api");
+    assert!(
+        sub["billing"]["basis"]
+            .as_str()
+            .unwrap()
+            .starts_with("inherited from its session claude:s1")
+    );
 
     let t1 = session(&rows, "codex:t1");
     assert_eq!(t1["total"]["tokens"]["input"], 303_000);
@@ -611,6 +621,238 @@ fn relative_config_and_dotdot_project_resolve_to_the_real_root() {
     assert_eq!(res.status.code(), Some(0));
     assert_eq!(read_jsonl(&out2.join("sessions.jsonl")).len(), 1);
     assert!(!scan_json(&out2)["project"].as_str().unwrap().contains(".."));
+}
+
+/// A Codex rollout file name in the session directories' scheme.
+fn rollout_file(dir: &Path, day: &str, thread: &str, seg: Option<&str>) -> PathBuf {
+    let name = match seg {
+        Some(s) => format!("rollout-{day}T00-00-00-{thread}_{s}.jsonl"),
+        None => format!("rollout-{day}T00-00-00-{thread}.jsonl"),
+    };
+    dir.join(name)
+}
+
+fn meta_line(id: &str, extra: &str) -> String {
+    format!(
+        r#"{{"timestamp":"2026-01-02T00:00:00Z","type":"session_meta","ordinal":0,"payload":{{"id":"{id}"{extra}}}}}"#
+    )
+}
+
+#[test]
+fn damaged_inputs_segments_forks_and_nested_subagents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    // Claude: one transcript with an invalid UTF-8 line, a nested subagent
+    // (started by another subagent), and an unreadable transcript.
+    let projects = root.join("claude");
+    let dir = projects.join("-work-proj");
+    std::fs::create_dir_all(dir.join("s1/subagents")).unwrap();
+    let mut main = br#"{"type":"user","uuid":"u1","sessionId":"s1","cwd":"/work/proj","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"go"}}
+{"type":"assistant","uuid":"a1","requestId":"r1","sessionId":"s1","cwd":"/work/proj","timestamp":"2026-01-01T00:00:02Z","message":{"id":"m1","model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"tu1","name":"Agent","input":{}}],"usage":{"input_tokens":1,"output_tokens":1}}}
+"#
+    .to_vec();
+    main.extend_from_slice(b"{\"type\":\"user\",\"x\":\"\xff\"}\n");
+    std::fs::write(dir.join("s1.jsonl"), main).unwrap();
+    std::fs::write(
+        dir.join("s1/subagents/agent-a1.jsonl"),
+        r#"{"type":"assistant","uuid":"b1","requestId":"r2","sessionId":"s1","isSidechain":true,"cwd":"/work/proj","timestamp":"2026-01-01T00:00:03Z","message":{"id":"m2","model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"tu2","name":"Agent","input":{}}],"usage":{"input_tokens":1,"output_tokens":1}}}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("s1/subagents/agent-a1.meta.json"),
+        r#"{"agentType":"x","toolUseId":"tu1"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("s1/subagents/agent-a2.jsonl"),
+        r#"{"type":"assistant","uuid":"c1","requestId":"r3","sessionId":"s1","isSidechain":true,"cwd":"/work/proj","timestamp":"2026-01-01T00:00:04Z","message":{"id":"m3","model":"claude-haiku-5-5","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("s1/subagents/agent-a2.meta.json"),
+        r#"{"agentType":"x","toolUseId":"tu2"}"#,
+    )
+    .unwrap();
+    let locked = dir.join("s7.jsonl");
+    std::fs::write(&locked, "{}\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let locked_unreadable = std::fs::read(&locked).is_err();
+
+    // Codex: a thread in two segments, a truncated rollout, and forks.
+    let sessions = root.join("codex/sessions/2026/01/02");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let archive = root.join("codex/archived");
+    std::fs::create_dir_all(&archive).unwrap();
+    let seg1 = rollout_file(&sessions, "2026-01-01", "tS", None);
+    let seg2 = rollout_file(&sessions, "2026-01-02", "tS", Some("sB"));
+    std::fs::write(
+        &seg1,
+        [
+            meta_line("tS", ""),
+            token_count("2026-01-01T00:00:01Z", 1, (1000, 100), (1000, 100)),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &seg2,
+        [
+            meta_line("tS", ""),
+            token_count("2026-01-02T00:00:01Z", 1, (1500, 150), (500, 50)),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let damaged = rollout_file(&sessions, "2026-01-02", "tD", None);
+    let body: String = (1..300u64)
+        .map(|i| token_count("2026-01-02T00:00:01Z", i, (100 * i, 10 * i), (100, 10)) + "\n")
+        .collect();
+    let z = zstd::encode_all(body.as_bytes(), 3).unwrap();
+    let damaged_zst = PathBuf::from(format!("{}.zst", damaged.display()));
+    std::fs::write(&damaged_zst, &z[..z.len() / 2]).unwrap();
+    // Forks of tS: one whose start is tS's first counter (verified), one
+    // whose first snapshot replays tS's last counter.
+    let fv = rollout_file(&sessions, "2026-01-02", "tFv", None);
+    std::fs::write(
+        &fv,
+        [
+            meta_line("tFv", r#","forked_from_id":"tS""#),
+            token_count("2026-01-02T00:00:05Z", 1, (1200, 110), (200, 10)),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let fr = rollout_file(&sessions, "2026-01-02", "tFr", None);
+    std::fs::write(
+        &fr,
+        [
+            meta_line("tFr", r#","forked_from_id":"tS""#),
+            token_count("2026-01-02T00:00:05Z", 1, (1500, 150), (500, 50)),
+            token_count("2026-01-02T00:00:06Z", 2, (1600, 160), (100, 10)),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let db = root.join("codex/state_5.sqlite");
+    let c = Connection::open(&db).unwrap();
+    c.execute_batch(
+        "create table threads (id text primary key, rollout_path text, created_at integer, updated_at integer,
+            created_at_ms integer, updated_at_ms integer, source text, cwd text, title text, tokens_used integer,
+            archived integer, model text, reasoning_effort text);",
+    )
+    .unwrap();
+    for (id, path, tokens) in [
+        ("tS", &seg2, 1650),
+        ("tD", &damaged, 32_890),
+        ("tFv", &fv, 1310),
+        ("tFr", &fr, 1760),
+    ] {
+        c.execute(
+            "insert into threads values (?1, ?2, 1767225600, 1767225700, null, null, 'vscode', '/work/proj', null, ?3, 0, 'gpt-6.1-terra', 'medium')",
+            params![id, path.to_str().unwrap(), tokens],
+        )
+        .unwrap();
+    }
+    drop(c);
+
+    let out = root.join("out");
+    let res = scan(
+        root,
+        &[
+            "--project",
+            "/work/proj",
+            "--out",
+            out.to_str().unwrap(),
+            "--claude-dir",
+            projects.to_str().unwrap(),
+            "--codex-db",
+            db.to_str().unwrap(),
+            "--codex-sessions",
+            root.join("codex/sessions").to_str().unwrap(),
+            "--codex-archive",
+            archive.to_str().unwrap(),
+            "--t3-db",
+            "/nonexistent/b.sqlite",
+        ],
+    );
+    // The replayed fork is an error finding: exit 1, outputs written.
+    assert_eq!(
+        res.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let rows = read_jsonl(&out.join("sessions.jsonl"));
+    let scan = scan_json(&out);
+    let cc = &scan["coverage"]["claude"];
+    assert_eq!(cc["invalid_utf8_lines"], 1);
+    if locked_unreadable {
+        assert_eq!(cc["unreadable_files"], 1);
+    }
+    assert_eq!(cc["subagent_parent_nested"], 1);
+    assert_eq!(cc["subagent_parent_mismatch"], 0);
+    assert_eq!(session(&rows, "claude:s1")["transcript"]["bad_lines"], 1);
+    assert_eq!(
+        session(&rows, "claude:s1/agent-a2")["parent_id"],
+        "s1/agent-a1"
+    );
+
+    let ts = session(&rows, "codex:tS");
+    assert_eq!(ts["total"]["tokens"]["input"], 1500);
+    assert_eq!(ts["untracked_tokens"], 0);
+    assert_eq!(ts["transcript"]["segments"].as_array().unwrap().len(), 2);
+    let td = session(&rows, "codex:tD");
+    assert_eq!(td["transcript"]["status"], "damaged");
+    assert_eq!(td["total"], Value::Null);
+    let cx = &scan["coverage"]["codex"];
+    assert_eq!(cx["threads_with_several_segments"], 1);
+    assert_eq!(cx["fork_baselines"]["verified"], 1);
+    assert_eq!(cx["fork_baselines"]["replayed"], 1);
+    assert_eq!(cx["rollouts"]["damaged"], 1);
+    let chk = &scan["cross_checks"]["codex_tokens_used"];
+    assert_eq!(chk["threads_compared"], 3);
+    assert_eq!(chk["tokens_used_equals_last_counter"], 3);
+    assert_eq!(
+        chk["own_plus_inherited_plus_untracked_minus_rewound_equals_last"],
+        true
+    );
+
+    let findings = read_jsonl(&out.join("findings.jsonl"));
+    let rule = |r: &str, subj: &str| {
+        findings
+            .iter()
+            .find(|f| f["rule"] == r && f["subject"] == subj)
+            .cloned()
+    };
+    assert!(rule("transcript-damaged", "codex:tD").is_some());
+    assert_eq!(
+        rule("fork-baseline", "codex:tFr").unwrap()["severity"],
+        "error"
+    );
+    assert!(rule("fork-baseline", "codex:tFv").is_none());
+    // Evidence names the segment holding the line, relative to that file.
+    for f in &findings {
+        for e in f["evidence"].as_array().unwrap() {
+            assert!(!e["path"].as_str().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 #[test]

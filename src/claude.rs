@@ -377,6 +377,30 @@ fn is_challenge_page(text: &str) -> bool {
         && (lower.contains("just a moment") || lower.contains("attention required"))
 }
 
+/// The range a `Read` call covers, as a file-reread key: `whole` without
+/// offset, limit or pages, otherwise those values.
+fn read_range(input: Option<&Value>) -> String {
+    let get = |k: &str| {
+        input
+            .and_then(|v| v.get(k))
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+    };
+    match (get("offset"), get("limit"), get("pages")) {
+        (None, None, None) => "whole".into(),
+        (o, l, p) => format!(
+            "offset {} limit {} pages {}",
+            o.unwrap_or_default(),
+            l.unwrap_or_default(),
+            p.unwrap_or_default()
+        ),
+    }
+}
+
 fn is_poll_tool(name: &str) -> bool {
     matches!(name, "TaskOutput" | "BashOutput") || name.ends_with("task_status")
 }
@@ -405,6 +429,32 @@ fn text_of_user_content(raw: &RawValue) -> (bool, bool, String) {
         }
     }
     (has_text, has_result, first)
+}
+
+/// A transcript's bytes as text. A line that is not valid UTF-8 (a damaged
+/// or truncated file) is replaced by U+FFFD, which is not JSON, so the
+/// parser counts it as a bad line; line numbers are kept. Returns the text
+/// and the number of lines replaced.
+pub fn utf8_lines(bytes: Vec<u8>) -> (String, u64) {
+    let bytes = match String::from_utf8(bytes) {
+        Ok(s) => return (s, 0),
+        Err(e) => e.into_bytes(),
+    };
+    let mut out = String::with_capacity(bytes.len());
+    let mut bad = 0;
+    for (i, line) in bytes.split(|b| *b == b'\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match std::str::from_utf8(line) {
+            Ok(l) => out.push_str(l),
+            Err(_) => {
+                bad += 1;
+                out.push('\u{fffd}');
+            }
+        }
+    }
+    (out, bad)
 }
 
 /// Parses one transcript already read into memory.
@@ -456,6 +506,7 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
     let mut last_ts: Option<i64> = None;
     let mut turns = 0u64;
     let mut active = 0i64;
+    let mut timed = 0u64;
     let mut orphan_results = 0u64;
     let mut session_id_mismatch = 0u64;
     let mut title_custom: Option<String> = None;
@@ -505,6 +556,12 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
         match kind {
             "assistant" => {
                 let Some(msg) = &r.message else { continue };
+                // A turn's work ends at its last assistant or tool-result
+                // record; meta and system records (hooks, local commands)
+                // do not extend it.
+                if ts.is_some() {
+                    last_ts = ts;
+                }
                 let model = msg.model.clone().unwrap_or_else(|| "unknown".into());
                 cx.stats.assistant_lines += 1;
                 if r.is_api_error == Some(true) {
@@ -593,7 +650,7 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
                         match name.as_str() {
                             "Read" => {
                                 if let Some(p) = field("file_path") {
-                                    tr.read(p, ln);
+                                    tr.read(p, &read_range(input), ln);
                                 }
                             }
                             "Bash" => {
@@ -626,6 +683,10 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
                 if has_text && !has_result {
                     if first.starts_with("[Request interrupted by user") {
                         s.aborts += 1;
+                        // The agent worked until it was interrupted.
+                        if ts.is_some() {
+                            last_ts = ts;
+                        }
                     } else if r.is_meta != Some(true)
                         && r.is_compact_summary != Some(true)
                         && r.visible_only != Some(true)
@@ -633,13 +694,18 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
                     {
                         if let (Some(st), Some(lt)) = (turn_start, last_ts) {
                             active += (lt - st).max(0);
-                            tr.intervals.push((st, lt));
+                            timed += 1;
+                            tr.intervals.push((st, lt.max(st)));
                         }
                         turn_start = Some(t);
+                        last_ts = None;
                         turns += 1;
                     }
                 }
                 if has_result {
+                    if ts.is_some() {
+                        last_ts = ts;
+                    }
                     let blocks: Vec<Block> =
                         serde_json::from_str(content.get()).unwrap_or_default();
                     let tur: Option<ToolUseResult> = r
@@ -727,13 +793,11 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
             "ai-title" => title_ai = r.ai_title.clone().or(title_ai),
             _ => {}
         }
-        if timeline && ts.is_some() {
-            last_ts = ts;
-        }
     }
     if let (Some(st), Some(lt)) = (turn_start, last_ts) {
         active += (lt - st).max(0);
-        tr.intervals.push((st, lt));
+        timed += 1;
+        tr.intervals.push((st, lt.max(st)));
     }
     s.open_turns = pending.len() as u64;
     if !pending.is_empty() {
@@ -794,14 +858,13 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
             search_price.map(|p| p * searches as f64)
         };
         let usd = match (multiplier, standard, search_usd) {
-            (Some(m), true, Some(su)) => {
-                cx.pricing
-                    .request_cost(&rq.model, &rq.tokens, m)
-                    .map(|c| RequestCost {
-                        usd: c.usd + su,
-                        ..c
-                    })
-            }
+            (Some(m), true, Some(su)) => cx
+                .pricing
+                .request_cost(&rq.model, &rq.tokens, rq.tokens.prompt(), m)
+                .map(|c| RequestCost {
+                    usd: c.usd + su,
+                    ..c
+                }),
             _ => None,
         };
         if usd.is_some() {
@@ -840,9 +903,9 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
     s.token_basis =
         "claude: message.usage counted once per requestId (else message.id) across all transcripts"
             .into();
-    s.turns = Some(turns);
-    s.active_ms = Some(active);
-    s.active_basis = "claude: sum over turns of (last record time - prompt time); a turn starts at a non-tool-result user prompt".into();
+    s.turns = (turns > 0).then_some(turns);
+    s.active_ms = (timed > 0).then_some(active);
+    s.active_basis = "claude: sum over turns of (last assistant or tool-result record time - prompt time); a turn starts at a non-tool-result user prompt; meta and system records do not extend a turn".into();
     s.error_basis = "claude: tool_result is_error flag".into();
     s.set_span(start, end);
     s.cwd = first_cwd.as_deref().map(tilde);
@@ -958,8 +1021,9 @@ this line is not json
         let (parsed, _) = parse_all(d.path());
         let s = &parsed[0].session;
         assert_eq!(s.turns, Some(2));
-        // 0:00 -> 0:09 and 1:00 -> 1:02.
-        assert_eq!(s.active_ms, Some(11_000));
+        // 0:00 -> 0:08 (the last tool result; the compaction records at
+        // 0:09 do not extend the turn) and 1:00 -> 1:02 (interrupted).
+        assert_eq!(s.active_ms, Some(10_000));
         assert_eq!(s.wall_ms, Some(62_000));
         assert_eq!(s.compactions.count, 1);
         assert_eq!(s.compactions.auto, 1);
@@ -971,9 +1035,82 @@ this line is not json
         assert_eq!(s.tools["Read"].results, 1);
         assert_eq!(s.tools["Read"].latency_ms_total, 1000);
         assert_eq!(s.tools["WebFetch"].calls, 1);
-        assert_eq!(parsed[0].trace.reads["/work/proj/a.md"].0, 1);
+        assert_eq!(parsed[0].trace.reads["/work/proj/a.md"].reads, 1);
         assert_eq!(s.client.as_deref(), Some("cli"));
         assert_eq!(s.by_effort["high"].requests, 2);
+    }
+
+    #[test]
+    fn meta_and_system_records_do_not_extend_a_turn() {
+        // A 10 s turn, then a hook's meta line and a local-command system
+        // record five hours later.
+        let text = r#"{"type":"user","uuid":"u1","sessionId":"s9","cwd":"/work/proj","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"go"}}
+{"type":"assistant","uuid":"a1","requestId":"q1","sessionId":"s9","timestamp":"2026-01-01T00:00:10Z","message":{"id":"m1","model":"claude-haiku-5-5","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}
+{"type":"user","uuid":"u2","sessionId":"s9","isMeta":true,"timestamp":"2026-01-01T05:00:00Z","message":{"role":"user","content":"hook output"}}
+{"type":"system","uuid":"y1","sessionId":"s9","subtype":"local_command","timestamp":"2026-01-01T05:00:01Z","content":"x"}
+"#;
+        let pricing = Pricing::load(None).unwrap();
+        let tz = TimeZone::UTC;
+        let mut seen = HashMap::new();
+        let mut stats = Stats::default();
+        let mut cx = Ctx {
+            pricing: &pricing,
+            tz: &tz,
+            include_titles: false,
+            large_output_chars: 100_000,
+            context_ratio: 0.9,
+            seen: &mut seen,
+            stats: &mut stats,
+        };
+        let c = Candidate {
+            path: "/work/x/s9.jsonl".into(),
+            stem: "s9".into(),
+            kind: Kind::Main,
+        };
+        let p = parse(&c, text, &mut cx);
+        assert_eq!(p.session.turns, Some(1));
+        assert_eq!(p.session.active_ms, Some(10_000));
+        // Wall time still spans every record.
+        assert_eq!(p.session.wall_ms, Some(5 * 3_600_000 + 1_000));
+
+        // No prompt and no reply: turns and active time are unknown.
+        let only_meta = r#"{"type":"system","uuid":"y2","sessionId":"s8","subtype":"local_command","timestamp":"2026-01-01T05:00:01Z","content":"x"}
+"#;
+        let c = Candidate {
+            path: "/work/x/s8.jsonl".into(),
+            stem: "s8".into(),
+            kind: Kind::Main,
+        };
+        let p = parse(&c, only_meta, &mut cx);
+        assert_eq!(p.session.turns, None);
+        assert_eq!(p.session.active_ms, None);
+    }
+
+    #[test]
+    fn invalid_utf8_lines_become_bad_lines() {
+        let mut b = br#"{"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"go"}}"#.to_vec();
+        b.extend_from_slice(b"\n{\"type\":\"user\",\"x\":\"\xff\xfe\"}\n{\"trunc");
+        b.extend_from_slice(&[0xe3, 0x81]);
+        let (text, bad) = utf8_lines(b);
+        assert_eq!(bad, 2);
+        assert_eq!(text.lines().count(), 3);
+        assert!(text.lines().nth(1).unwrap().starts_with('\u{fffd}'));
+        let (ok, none) = utf8_lines(b"{}\n".to_vec());
+        assert_eq!((ok.as_str(), none), ("{}\n", 0));
+    }
+
+    #[test]
+    fn read_ranges_key_rereads() {
+        let v = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        assert_eq!(read_range(Some(&v(r#"{"file_path":"/a"}"#))), "whole");
+        assert_eq!(
+            read_range(Some(&v(r#"{"file_path":"/a","offset":100,"limit":50}"#))),
+            "offset 100 limit 50 pages "
+        );
+        assert_ne!(
+            read_range(Some(&v(r#"{"file_path":"/a","offset":1}"#))),
+            read_range(Some(&v(r#"{"file_path":"/a","offset":2}"#)))
+        );
     }
 
     #[test]

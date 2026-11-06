@@ -57,6 +57,7 @@ Flags:
 | `--claude-dir` | `~/.claude/projects` |
 | `--codex-db` | `~/.codex/state_5.sqlite` |
 | `--codex-archive` | `~/.codex/archived_sessions` |
+| `--codex-sessions` | `~/.codex/sessions`. Searched, with the archive, for the earlier rollout segments of resumed threads. |
 | `--t3-db` | `~/.t3/userdata/statev2.sqlite` |
 | `--billing-log` | `~/.local/state/claude-api/decisions.jsonl` |
 | `--pricing` | The built-in `pricing.toml`. |
@@ -67,7 +68,10 @@ Flags:
 
 The detector thresholds are listed under [Rules](#rules).
 
-A missing input file is reported in `scan.json` under `inputs` and `coverage`. It is not an error.
+A missing input file is reported in `scan.json` under `inputs` and `coverage`. It is not an error. Neither is a damaged transcript:
+
+- A Claude line that is not valid UTF-8 counts as a bad line (`coverage.claude.invalid_utf8_lines`). A transcript that cannot be read is skipped and listed under `coverage.claude.unreadable`.
+- A Codex rollout segment that fails to open or decompress part-way marks the transcript `damaged`. Its tokens, `by_*` breakdowns, active and wall time become unknown, and a `transcript-damaged` finding is written. The tokens counted before the break are only reported in aggregate, as `coverage.codex.tokens_counted_before_damage_excluded`.
 
 ### `agentprof report`
 
@@ -109,7 +113,7 @@ timezone = "Asia/Tokyo"
 [agentprof]
 out = "profile"            # relative paths resolve against this file's directory
 t3_project = "0b4c..."
-# claude_dir, codex_db, codex_archive, t3_db, billing_log, pricing
+# claude_dir, codex_db, codex_archive, codex_sessions, t3_db, billing_log, pricing
 ```
 
 Flags override the file. Unknown keys in `[agentprof]` are an error.
@@ -146,12 +150,13 @@ One JSON object per line. The fields:
 | `wall_ms` | integer or null | `end - start`. Null when either is unknown. |
 | `active_ms` | integer or null | See [Time](#time). |
 | `active_basis` | string | How `active_ms` was computed. |
-| `turns`, `open_turns` | integer | User turns, and turns still open at the end of the record. |
+| `turns`, `open_turns` | integer or null, integer | User turns (null when the record has no turn events), and turns still open at the end of the record. |
 | `total` | Acc or null | Tokens and cost. Null when the source has no per-request data. |
 | `token_basis` | string | How `total` was computed. |
 | `by_model`, `by_effort`, `by_day` | map of Acc | Disjoint partitions of `total`. `by_day` uses the configured time zone. |
 | `db_tokens_used` | integer or null | Codex `threads.tokens_used`. Shown for comparison; never added to totals. |
-| `inherited_tokens` | integer or null | Codex counter value inherited from the base thread. Excluded from `total`. |
+| `inherited_tokens` | integer or null | Codex: the counter value a forked thread started from, its base thread's usage. Excluded from `total`. |
+| `untracked_tokens` | integer or null | Codex: the counter value a thread that was not forked started from, its own usage in records that are missing or unreadable. Excluded from `total`, which is then a lower bound; see `history-gap`. |
 | `max_prompt_tokens`, `context_window` | integer or null | Largest single-request prompt, and the model's window. |
 | `tools` | map of ToolStat | Per tool name: `calls`, `results`, `errors`, `latency_ms_total`, `latency_ms_max`, `result_chars_total`, `result_chars_max`. |
 | `error_basis` | string | What counts as a tool error for this source. |
@@ -164,7 +169,7 @@ One JSON object per line. The fields:
 | `cost` | object | `usd` (null if any request is unpriced), `priced_usd`, `unpriced_requests`, `unpriced_models`, `server_tool_usd`, `basis` |
 | `billing` | object | `mode`: `subscription`, `api`, `refused` or `unknown`. Also `basis` and `plan_type`. |
 | `claude_code_cost_usd` | number or null | Claude Code's own cost counter. Reported, never used. |
-| `transcript` | object or null | `path`, `status` (`present`, `zstd`, `missing`), `lines`, `bad_lines`, `inherited_lines` |
+| `transcript` | object or null | `path` (Codex: the newest segment), `status` (`present`, `zstd`, `missing`; Codex also `damaged` or `incomplete`, when the recorded newest segment is missing but earlier ones exist), `lines`, `bad_lines`, `inherited_lines`; `segments` (Codex: every segment file read, oldest first, when there are several) and `error` (the read error of a damaged transcript). |
 | `t3` | object or null | T3 threads only. `project_id`, `provider`, `runs_by_status`, `runs_by_model`, `runs_by_effort`, `runs_by_provider` (the run's own provider, then status), `archived`, `deleted`, `linked` (`<source>:<id>`), `link_basis`, `unresolved_links`. |
 | `notes` | array of string | Caveats specific to this session, such as an assumed service tier. |
 
@@ -184,14 +189,15 @@ The classes `input`, the three cache writes, `cache_read` and `output` are disjo
 
 - **Wall time** is first record to last record. For T3, it is first run start to last run end. A T3 thread without runs has unknown wall time.
 - **Active time** is model-working time:
-  - **Claude:** over turns, the time from the prompt to the turn's last record.
+  - **Claude:** over turns, the time from the prompt to the turn's last assistant record, tool result or interruption. Meta lines (hook output) and system records (local commands, hooks, compaction) do not extend a turn.
   - **Codex:** the sum of `duration_ms` from `task_complete` and `turn_aborted`. A turn without an end event counts up to its last record.
   - **T3:** the sum over runs of `completedAt − startedAt`.
+- Active time and turns are null, not 0, when the record has no turn events or no timed turn. The unions in `scan.json` leave those sessions out and count them under `sessions_with_unknown_active_time`.
 - Summing active time over sessions counts parallel subagents twice. `scan.json` `active_union_ms` therefore also gives the length of the union of the intervals: per source, Claude plus Codex, and all sources.
 
 ### Cost
 
-Cost is an **API-equivalent estimate**: what the counted tokens would cost at the list prices in `pricing.toml`. It is not what was billed. A subscription session costs its plan fee. Requests are priced individually, including long-context tiers. A request is unpriced, so the session's `cost.usd` is null, in these cases:
+Cost is an **API-equivalent estimate**: what the counted tokens would cost at the list prices in `pricing.toml`. It is not what was billed. A subscription session costs its plan fee. Requests are priced individually, including long-context tiers. The tier follows the request's own prompt: for Claude, the request's prompt; for Codex, the event's `last_token_usage.input_tokens`. A Codex counter increment can span several requests (it then differs from `last_token_usage`); it is priced at the tier of the last of them, the only one whose size is known. `coverage.codex.multi_request_increments` counts such increments, and `multi_request_increments_tier_differs` those whose summed prompt would have crossed the threshold differently. A request is unpriced, so the session's `cost.usd` is null, in these cases:
 
 - The model has no price row.
 - Claude reports a non-standard `speed` or `service_tier`.
@@ -203,7 +209,7 @@ When Codex records no tier, standard is assumed and a note says so.
 
 ### Billing mode
 
-- **Claude:** the latest decision in the billing log made for the same directory at most 120 s before the session's first record. Otherwise the mode is `unknown`.
+- **Claude:** the latest decision in the billing log made for the same directory at most 120 s before the session's first record. Otherwise the mode is `unknown`. A subagent inherits its session's mode, with a basis that says so; only a subagent whose session is not in the scan is looked up by its own first record.
 - **Codex:** `subscription` when the rollout's rate-limit snapshots carry a `plan_type`. Otherwise the mode is `unknown`.
 
 ### T3 linkage
@@ -225,13 +231,13 @@ T3 threads carry no tokens, so linking never adds tokens. `coverage.t3` reports 
  "data":{"max_reads":9},"at":"2026-11-07T00:00:00Z"}
 ```
 
-`subject` is `source:id`, or `project:<source>` for project-level findings. `evidence.path` shows the home directory as `~`. Findings never contain file contents. Commands appear only as a hash plus the program name.
+`subject` is `source:id`, or `project:<source>` for project-level findings. `evidence.path` shows the home directory as `~`; for a Codex thread read from several segments, it names the segment holding the line and the line number within it. Findings never contain file contents. Commands appear only as a hash plus the program name.
 
 ## Rules
 
 | Rule | Severity | Fires when | Threshold flag (default) |
 |---|---|---|---|
-| `file-reread` | warn | One file is read at least N times in a session. | `--reread-min` (5) |
+| `file-reread` | warn | One range of a file is read again: after a first read, at least N − 1 more reads repeat a range already read. A range is the whole file, or a Claude `Read` offset/limit/pages, or a Codex `sed -n 'a,bp'` line range; `cat` and `nl` read the whole file, and any other Codex read command repeats only when identical. Reads of different ranges are not rereads. | `--reread-min` (5) |
 | `repeated-command` | warn | One identical shell command runs at least N times. | `--repeat-cmd-min` (4) |
 | `large-tool-output` | warn | A tool result returns at least N characters. | `--large-output-chars` (100000) |
 | `tool-error-streak` | warn | At least N consecutive tool results are errors. | `--error-streak-min` (4) |
@@ -246,14 +252,18 @@ T3 threads carry no tokens, so linking never adds tokens. `coverage.t3` reports 
 | `rate-limit-saturation` | warn | A usage window was at or above 100 %, a limit was reached, or a request was refused for a limit. | none |
 | `api-error` | warn | API errors other than usage limits. | none |
 | `turn-aborted` | info | Turns were interrupted or aborted. | none |
-| `inherited-counter` | info | A Codex thread's counter started from inherited history. The inherited part is excluded. | none |
+| `inherited-counter` | info | A forked Codex thread's counter started from its base thread's usage. The inherited part is excluded. | none |
+| `history-gap` | warn | A Codex thread that was not forked has a counter that starts above zero: its own usage in records that are missing or unreadable. Those tokens are excluded, so the thread's totals are a lower bound. | none |
+| `fork-baseline` | **error** if the fork's first counter repeats a counter of its base thread (the first request would be the base thread's, counted twice); warn if the starting counter matches no counter of the base thread | Forked Codex threads are checked against their base thread's counters when both are in the scan; `coverage.codex.fork_baselines` counts `verified`, `zero_base`, `parent_unavailable`, `replayed` and `mismatched`. | none |
+| `counter-unparseable` | warn | A Codex `token_count` event did not parse. Later counters still cover its tokens; if it came before the first readable counter, its tokens end up in `untracked_tokens`. | none |
+| `transcript-damaged` | warn | A transcript could not be read to the end (Codex `damaged`), or the recorded newest Codex segment is missing while earlier ones exist (`incomplete`). The thread's tokens are unknown. | none |
 | `counter-decrease` | **error** | A Codex cumulative counter decreased, so the session's tokens are unreliable. | none |
 | `usage-conflict` | warn | One Claude request appears with different usage on different lines. The line with the largest output is kept. | none |
 | `transcript-missing` | warn | A Codex rollout file no longer exists. | none |
 | `run-failed` | warn | T3 runs failed. | none |
 | `run-interrupted` | info | T3 runs were interrupted, cancelled or rolled back. | none |
 | `t3-unlinked` | info | A T3 thread links to no native session. | none |
-| `subagent-fanout` | info | A session has at least N direct child sessions. | `--fanout-min` (5) |
+| `subagent-fanout` | info | A session has at least N direct child sessions. A Claude subagent started by another subagent is that subagent's child (`coverage.claude.subagent_parent_nested`), not the session's. | `--fanout-min` (5) |
 | `subagent-token-share` | info | The share of a source's tokens spent in subagents. Always reported, once per source. | none |
 
 ## `scan.json` cross-checks
@@ -261,7 +271,7 @@ T3 threads carry no tokens, so linking never adds tokens. `coverage.t3` reports 
 | Check | Compares | Expected result |
 |---|---|---|
 | `claude_dedup` | Naive per-line usage sums vs the deduplicated totals. | The inflation factor per class that naive counting would cause. Usage conflicts and cross-file duplicates are counted. |
-| `codex_tokens_used` | Each thread's last cumulative counter vs `threads.tokens_used`. | `tokens_used_equals_last_counter` for every compared thread, and `sum_own_total + sum_inherited_at_start = sum_last_counter_total`. `tokens_used_overcount_factor` is `tokens_used` vs own usage. |
+| `codex_tokens_used` | Each thread's last cumulative counter vs `threads.tokens_used`. Damaged and incomplete threads are not compared. | `tokens_used_equals_last_counter` for every compared thread, and `sum_own_total + sum_inherited_at_start + sum_untracked_at_start = sum_last_counter_total + sum_rewound` (`sum_rewound`: tokens of rolled-back requests, see [Limitations](#limitations)). `tokens_used_overcount_factor` is `tokens_used` vs own usage. |
 | `t3_runs` | Parsed run counts by run provider and status vs a direct SQL `GROUP BY`. | `equal: true`. |
 
 ## Pricing
@@ -287,6 +297,8 @@ By default, outputs contain no message text, tool input or tool output.
 ## Limitations
 
 - Codex cache writes are mapped to `cache_write_unknown`. Codex logs have not been seen to report non-zero cache writes.
+- Codex segments are matched by file name (`rollout-<time>-<thread>[_<segment>].jsonl[.zst]`) in `--codex-sessions` and `--codex-archive`. Segments elsewhere are not found; their usage then shows as `untracked_tokens`.
+- A later Codex segment can resume from an earlier state: it restarts the last turn, and its first counter continues from the value before that turn, below the previous segment's last counter. The rolled-back requests were made, so their tokens stay in `total`; the segment's first request counts as its own `last_token_usage`, and no `counter-decrease` is reported. The thread's last counter, and `threads.tokens_used`, then omit the rolled-back tokens. `coverage.codex.segment_rewinds` gives the `count`, the `rewound_tokens`, and `starting_counter_unmatched`, rewinds whose starting value is no earlier counter of the thread; each such thread has a note.
 - Codex `openPage` web actions carry no HTTP status and are counted as `no-status`.
 - The billing mode is only as complete as the billing log. With no matching decision, it is `unknown`.
 - T3 run times measure orchestration. A run's native session may continue after T3 marks the run complete.

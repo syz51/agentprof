@@ -12,7 +12,8 @@ pub const FINDING_SCHEMA: &str = "rf.finding/1";
 
 #[derive(Args, Serialize, Deserialize, Clone, Debug)]
 pub struct Thresholds {
-    /// file-reread: reads of one file in one session
+    /// file-reread: reads of one file in one session, counting a read only
+    /// when it repeats a range (or whole-file read) already made
     #[arg(long, default_value_t = 5)]
     pub reread_min: u64,
     /// repeated-command: runs of one identical shell command in one session
@@ -92,6 +93,18 @@ pub struct Finding {
     pub at: String,
 }
 
+/// Reads of one file. A read is keyed by its range (`whole`, or the
+/// offset/limit or line range); only a repeat of an earlier key counts as a
+/// reread.
+#[derive(Default, Debug, Clone)]
+pub struct ReadStat {
+    pub reads: u64,
+    pub rereads: u64,
+    pub first_line: u64,
+    pub first_reread_line: Option<u64>,
+    pub ranges: HashMap<String, u64>,
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct CmdStat {
     pub count: u64,
@@ -105,9 +118,12 @@ pub struct CmdStat {
 pub struct Trace {
     /// Transcript path for evidence, home shown as `~`.
     pub evidence: String,
+    /// For a transcript read from several files: (lines before the file,
+    /// path) in read order, so evidence names the file holding a line.
+    pub segments: Vec<(u64, String)>,
     /// Timestamps of the records, in file order.
     pub times: Vec<i64>,
-    pub reads: HashMap<String, (u64, u64)>,
+    pub reads: HashMap<String, ReadStat>,
     pub commands: HashMap<String, CmdStat>,
     pub sleeps: u64,
     pub first_sleep_line: Option<u64>,
@@ -124,14 +140,29 @@ pub struct Trace {
     pub rate_limit_lines: Vec<u64>,
     pub api_error_lines: Vec<u64>,
     pub counter_decrease_lines: Vec<u64>,
+    /// Codex `token_count` events whose payload did not parse.
+    pub unparseable_counter_lines: Vec<u64>,
     pub delta_mismatches: u64,
     pub usage_conflicts: u64,
 }
 
 impl Trace {
-    pub fn read(&mut self, path: &str, line: u64) {
-        let e = self.reads.entry(path.to_string()).or_insert((0, line));
-        e.0 += 1;
+    /// Records a read of `range` (`whole` for the whole file) of `path`.
+    pub fn read(&mut self, path: &str, range: &str, line: u64) {
+        let e = self
+            .reads
+            .entry(path.to_string())
+            .or_insert_with(|| ReadStat {
+                first_line: line,
+                ..ReadStat::default()
+            });
+        e.reads += 1;
+        let n = e.ranges.entry(range.to_string()).or_default();
+        *n += 1;
+        if *n > 1 {
+            e.rereads += 1;
+            e.first_reread_line.get_or_insert(line);
+        }
     }
 
     pub fn command(&mut self, cmd: &str, line: u64) {
@@ -157,7 +188,7 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    fn finding(
+    pub fn finding(
         &self,
         rule: &str,
         severity: &str,
@@ -181,6 +212,12 @@ impl Ctx<'_> {
 }
 
 fn ev(trace: &Trace, line: u64) -> Vec<Evidence> {
+    if let Some((off, path)) = trace.segments.iter().rev().find(|(off, _)| *off < line) {
+        return vec![Evidence {
+            path: path.clone(),
+            locator: format!("line {}", line - off),
+        }];
+    }
     if trace.evidence.is_empty() {
         return Vec::new();
     }
@@ -209,32 +246,33 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
     let subject = s.key();
     let mut out = Vec::new();
 
-    // file-reread
-    let mut rereads: Vec<(&String, &(u64, u64))> = t
+    // file-reread: one read plus at least reread_min - 1 repeats of a
+    // range already read.
+    let mut rereads: Vec<(&String, &ReadStat)> = t
         .reads
         .iter()
-        .filter(|(_, (n, _))| *n >= th.reread_min)
+        .filter(|(_, r)| r.rereads + 1 >= th.reread_min.max(2))
         .collect();
-    rereads.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
-    if let Some((_, (max, line))) = rereads.first() {
+    rereads.sort_by(|a, b| b.1.rereads.cmp(&a.1.rereads).then(a.0.cmp(b.0)));
+    if let Some((_, top)) = rereads.first() {
         let files: Vec<Value> = rereads
             .iter()
             .take(10)
-            .map(|(p, (n, _))| json!({"path": crate::util::tilde(p), "reads": n}))
+            .map(|(p, r)| json!({"path": crate::util::tilde(p), "reads": r.reads, "repeat_reads": r.rereads}))
             .collect();
-        let extra: u64 = rereads.iter().map(|(_, (n, _))| n - 1).sum();
+        let extra: u64 = rereads.iter().map(|(_, r)| r.rereads).sum();
         out.push(cx.finding(
             "file-reread",
             "warn",
             &subject,
             format!(
-                "{} file(s) were read at least {} times; the most-read file {} times",
+                "{} file(s) had the same range read again at least {} times; the most {} times",
                 rereads.len(),
-                th.reread_min,
-                max
+                th.reread_min.max(2) - 1,
+                top.rereads
             ),
-            ev(t, *line),
-            json!({"files_over_threshold": rereads.len(), "max_reads": max, "repeat_reads": extra, "top": files}),
+            ev(t, top.first_reread_line.unwrap_or(top.first_line)),
+            json!({"files_over_threshold": rereads.len(), "max_reads": top.reads, "max_repeat_reads": top.rereads, "repeat_reads": extra, "top": files}),
         ));
     }
 
@@ -542,6 +580,35 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
         ));
     }
 
+    // history-gap (data integrity)
+    if let Some(u) = s.untracked_tokens.filter(|v| *v > 0) {
+        out.push(cx.finding(
+            "history-gap",
+            "warn",
+            &subject,
+            format!(
+                "the thread was not forked, yet its token counter started at {u} tokens: its own usage in records that are missing or unreadable. Those tokens are not in the totals, so the thread's tokens and cost are a lower bound"
+            ),
+            Vec::new(),
+            json!({"untracked_tokens": u, "db_tokens_used": s.db_tokens_used}),
+        ));
+    }
+
+    // counter-unparseable (data integrity)
+    if let Some(line) = t.unparseable_counter_lines.first() {
+        out.push(cx.finding(
+            "counter-unparseable",
+            "warn",
+            &subject,
+            format!(
+                "{} token counter event(s) did not parse; later counters still cover their tokens, but the requests' split by model, day and tier may be off",
+                t.unparseable_counter_lines.len()
+            ),
+            ev(t, *line),
+            json!({"events": t.unparseable_counter_lines.len()}),
+        ));
+    }
+
     // counter-decrease (data integrity)
     if let Some(line) = t.counter_decrease_lines.first() {
         out.push(cx.finding(
@@ -583,6 +650,29 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
             "the session's transcript file no longer exists; only database totals are available".to_string(),
             Vec::new(),
             json!({"path": tr.path, "db_tokens_used": s.db_tokens_used}),
+        ));
+    }
+
+    // transcript-damaged
+    if let Some(tr) = &s.transcript
+        && matches!(tr.status.as_str(), "damaged" | "incomplete" | "unreadable")
+    {
+        let message = match tr.status.as_str() {
+            "incomplete" => {
+                "earlier rollout segments exist but the newest one the database records is missing; the thread's tokens are unknown"
+            }
+            "damaged" => {
+                "a rollout segment could not be read to the end; the thread's tokens are unknown"
+            }
+            _ => "the transcript could not be read; it was skipped",
+        };
+        out.push(cx.finding(
+            "transcript-damaged",
+            "warn",
+            &subject,
+            message.to_string(),
+            Vec::new(),
+            json!({"status": tr.status, "path": tr.path, "error": tr.error, "lines_read": tr.lines, "db_tokens_used": s.db_tokens_used}),
         ));
     }
 
@@ -729,10 +819,14 @@ mod tests {
         let s = Session::new("claude", "s1");
         let mut t = Trace::default();
         for i in 0..5 {
-            t.read("/p/a.md", i);
+            t.read("/p/a.md", "whole", i);
         }
         for i in 0..4 {
-            t.read("/p/b.md", i);
+            t.read("/p/b.md", "whole", i);
+        }
+        // Different ranges of one file are not rereads.
+        for i in 0..8 {
+            t.read("/p/c.md", &format!("{}+100", i * 100), i);
         }
         for i in 0..4 {
             t.outcomes.push((true, 10 + i));
@@ -745,6 +839,46 @@ mod tests {
         let rr = f.iter().find(|f| f.rule == "file-reread").unwrap();
         assert_eq!(rr.data["files_over_threshold"], 1);
         assert_eq!(rr.data["max_reads"], 5);
+        assert_eq!(rr.data["max_repeat_reads"], 4);
+    }
+
+    #[test]
+    fn evidence_names_the_segment_holding_a_line() {
+        let t = Trace {
+            evidence: "~/s/new.jsonl".into(),
+            segments: vec![(0, "~/s/old.jsonl".into()), (10, "~/s/new.jsonl".into())],
+            ..Trace::default()
+        };
+        assert_eq!(ev(&t, 4)[0].path, "~/s/old.jsonl");
+        assert_eq!(ev(&t, 10)[0].locator, "line 10");
+        assert_eq!(ev(&t, 12)[0].path, "~/s/new.jsonl");
+        assert_eq!(ev(&t, 12)[0].locator, "line 2");
+    }
+
+    #[test]
+    fn data_integrity_rules_fire() {
+        let th = ctx_th();
+        let cx = Ctx { th: &th, at: "x" };
+        let mut s = Session::new("codex", "t");
+        s.untracked_tokens = Some(500);
+        s.transcript = Some(crate::session::Transcript {
+            status: "damaged".into(),
+            error: Some("x: read failed".into()),
+            ..Default::default()
+        });
+        let t = Trace {
+            unparseable_counter_lines: vec![3],
+            ..Trace::default()
+        };
+        let f = per_session(&s, &t, &cx);
+        let rules: Vec<&str> = f.iter().map(|f| f.rule.as_str()).collect();
+        for r in ["history-gap", "counter-unparseable", "transcript-damaged"] {
+            assert!(rules.contains(&r), "{r}");
+        }
+        s.untracked_tokens = Some(0);
+        s.transcript = None;
+        let f = per_session(&s, &Trace::default(), &cx);
+        assert!(f.is_empty());
     }
 
     #[test]

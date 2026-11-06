@@ -54,6 +54,9 @@ pub struct ScanArgs {
     /// Codex archived rollouts [default: ~/.codex/archived_sessions]
     #[arg(long)]
     pub codex_archive: Option<PathBuf>,
+    /// Codex rollout directory, searched for a thread's earlier segments [default: ~/.codex/sessions]
+    #[arg(long)]
+    pub codex_sessions: Option<PathBuf>,
     /// T3 Code state database [default: ~/.t3/userdata/statev2.sqlite]
     #[arg(long)]
     pub t3_db: Option<PathBuf>,
@@ -100,6 +103,7 @@ struct AgentprofTable {
     claude_dir: Option<PathBuf>,
     codex_db: Option<PathBuf>,
     codex_archive: Option<PathBuf>,
+    codex_sessions: Option<PathBuf>,
     t3_db: Option<PathBuf>,
     billing_log: Option<PathBuf>,
     pricing: Option<PathBuf>,
@@ -138,6 +142,7 @@ struct Inputs {
     claude_dir: PathBuf,
     codex_db: PathBuf,
     codex_archive: PathBuf,
+    codex_sessions: PathBuf,
     t3_db: PathBuf,
     billing_log: PathBuf,
     pricing: Option<PathBuf>,
@@ -228,6 +233,11 @@ fn resolve(a: &ScanArgs) -> Result<Inputs> {
             .clone()
             .or(rel(ap.codex_archive))
             .unwrap_or(h.join(".codex/archived_sessions")),
+        codex_sessions: a
+            .codex_sessions
+            .clone()
+            .or(rel(ap.codex_sessions))
+            .unwrap_or(h.join(".codex/sessions")),
         t3_db: a
             .t3_db
             .clone()
@@ -362,12 +372,30 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
         let cands = claude::discover(&inp.claude_dir)?;
         let needle = claude::cwd_needle(root);
         let mut included_main: HashSet<String> = HashSet::new();
-        let mut selected: Vec<(claude::Candidate, String, &'static str)> = Vec::new();
         let mut files_scanned = 0u64;
+        let mut unreadable: Vec<String> = Vec::new();
+        let mut invalid_utf8_lines = 0u64;
+        let mut seen = HashMap::new();
+        let mut cx = claude::Ctx {
+            pricing: &pricing,
+            tz: &inp.tz,
+            include_titles: a.include_titles,
+            large_output_chars: th.large_output_chars,
+            context_ratio: th.context_ratio,
+            seen: &mut seen,
+            stats: &mut claude_stats,
+        };
+        let mut parent_tool: Vec<(usize, String)> = Vec::new();
         for c in cands {
             files_scanned += 1;
-            let text = std::fs::read_to_string(&c.path)
-                .with_context(|| format!("reading {}", c.path.display()))?;
+            let bytes = match std::fs::read(&c.path) {
+                Ok(b) => b,
+                Err(e) => {
+                    unreadable.push(format!("{}: {e}", display_path(&c.path)));
+                    continue;
+                }
+            };
+            let (text, bad) = claude::utf8_lines(bytes);
             let hit = mentions_cwd(&text, &needle);
             let basis = match &c.kind {
                 claude::Kind::Main => {
@@ -389,27 +417,15 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
                     }
                 }
             };
-            if let Some(b) = basis {
-                if matches!(c.kind, claude::Kind::Main) {
-                    included_main.insert(c.stem.clone());
-                }
-                selected.push((c, text, b));
+            let Some(basis) = basis else { continue };
+            invalid_utf8_lines += bad;
+            if matches!(c.kind, claude::Kind::Main) {
+                included_main.insert(c.stem.clone());
             }
-        }
-        let mut seen = HashMap::new();
-        let mut cx = claude::Ctx {
-            pricing: &pricing,
-            tz: &inp.tz,
-            include_titles: a.include_titles,
-            large_output_chars: th.large_output_chars,
-            context_ratio: th.context_ratio,
-            seen: &mut seen,
-            stats: &mut claude_stats,
-        };
-        let mut parent_tool: Vec<(String, String)> = Vec::new();
-        for (c, text, basis) in &selected {
-            let mut p = claude::parse(c, text, &mut cx);
-            p.session.match_basis = (*basis).to_string();
+            // Parsed as soon as it is selected, so only one transcript's
+            // text is held at a time.
+            let mut p = claude::parse(&c, &text, &mut cx);
+            p.session.match_basis = basis.to_string();
             let key = p.session.key();
             for u in p.uuids {
                 uuid_owner.entry(u).or_insert_with(|| key.clone());
@@ -418,22 +434,35 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
                 tool_use_owner.insert(t, p.session.id.clone());
             }
             if let Some(t) = p.parent_tool_use {
-                parent_tool.push((key.clone(), t));
+                parent_tool.push((sessions.len(), t));
             }
             claude_raw.insert(key.clone(), (p.first_cwd, p.start_ms));
             traces.insert(key, p.trace);
             sessions.push(p.session);
         }
         // Check subagent parents against the meta file's spawning tool call.
+        // A subagent started by another subagent of the same session has the
+        // directory's session as its directory parent but the spawning
+        // subagent as its real parent.
         let mut parent_mismatch = 0u64;
         let mut parent_unverified = 0u64;
-        for (key, tool) in parent_tool {
-            let s = sessions
-                .iter_mut()
-                .find(|s| s.key() == key)
-                .expect("parsed");
+        let mut parent_nested = 0u64;
+        for (i, tool) in parent_tool {
+            let s = &mut sessions[i];
             match tool_use_owner.get(&tool) {
                 Some(owner) if Some(owner) == s.parent_id.as_ref() => {}
+                Some(owner)
+                    if s.parent_id
+                        .as_ref()
+                        .is_some_and(|p| owner.starts_with(&format!("{p}/")))
+                        && *owner != s.id =>
+                {
+                    parent_nested += 1;
+                    s.notes.push(format!(
+                        "started by subagent claude:{owner} of the same session"
+                    ));
+                    s.parent_id = Some(owner.clone());
+                }
                 Some(owner) => {
                     parent_mismatch += 1;
                     s.notes.push(format!(
@@ -460,8 +489,12 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             "by_match_basis": by_basis,
             "lines": claude_stats.lines,
             "bad_lines": claude_stats.bad_lines,
+            "invalid_utf8_lines": invalid_utf8_lines,
+            "unreadable_files": unreadable.len(),
+            "unreadable": unreadable,
             "subagent_parent_mismatch": parent_mismatch,
             "subagent_parent_unverified": parent_unverified,
+            "subagent_parent_nested": parent_nested,
         });
         let st = &claude_stats;
         checks.insert(
@@ -486,6 +519,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
     coverage.insert("claude".into(), claude_cov);
 
     // ---- Codex.
+    let mut fork_findings: Vec<Finding> = Vec::new();
     let mut turn_owner: HashMap<String, String> = HashMap::new();
     let mut codex_cov = json!({"present": false});
     if inp.codex_db.is_file() {
@@ -550,8 +584,10 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             large_output_chars: th.large_output_chars,
             context_ratio: th.context_ratio,
         };
+        // Earlier segments of resumed threads are not in the database.
+        let seg_index = codex::Index::build(&[&inp.codex_sessions, &inp.codex_archive]);
         let next = AtomicUsize::new(0);
-        let results: Mutex<Vec<(usize, Result<codex::Parsed>)>> = Mutex::new(Vec::new());
+        let results: Mutex<Vec<(usize, codex::Parsed)>> = Mutex::new(Vec::new());
         std::thread::scope(|sc| {
             for _ in 0..jobs {
                 sc.spawn(|| {
@@ -559,7 +595,8 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(t) = selected.get(i) else { break };
                         let r = codex::resolve(&t.rollout_path, Some(&inp.codex_archive));
-                        let p = codex::parse(t, &r, &cx);
+                        let segs = seg_index.segments(&t.id, r);
+                        let p = codex::parse(t, &segs, &cx);
                         results.lock().expect("no poisoned lock").push((i, p));
                     }
                 });
@@ -576,10 +613,32 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
         let mut cmp = json!({});
         let (mut equal, mut differ, mut compared) = (0u64, 0u64, 0u64);
         let (mut sum_db, mut sum_last, mut sum_own, mut sum_inh) = (0u64, 0u64, 0u64, 0u64);
+        let (mut sum_untracked, mut sum_rewound) = (0u64, 0u64);
+        let (mut rewinds, mut rewinds_unmatched, mut rewound_total) = (0u64, 0u64, 0u64);
         let mut examples = Vec::new();
-        for (i, r) in results {
+        let (mut multi_inc, mut multi_tier, mut unparseable) = (0u64, 0u64, 0u64);
+        let (mut untracked_threads, mut untracked_total) = (0u64, 0u64);
+        let (mut segmented_threads, mut segment_files) = (0u64, 0u64);
+        let mut damaged_counted = 0u64;
+        // Fork baselines are checked against the base thread's counters.
+        let mut counters: HashMap<String, Vec<u64>> = HashMap::new();
+        let mut forks: Vec<(String, String, u64, u64)> = Vec::new();
+        for (i, mut p) in results {
             let t = selected[i];
-            let mut p = r.with_context(|| format!("codex thread {}", t.id))?;
+            multi_inc += p.check.multi_request_increments;
+            multi_tier += p.check.multi_request_tier_differs;
+            unparseable += p.check.unparseable_counters;
+            rewinds += p.check.rewinds;
+            rewinds_unmatched += p.check.rewinds_unmatched;
+            rewound_total += p.check.rewound;
+            if p.check.untracked > 0 {
+                untracked_threads += 1;
+                untracked_total += p.check.untracked;
+            }
+            if let (Some(f), Some((total, base))) = (&p.forked_from, p.first_counter) {
+                forks.push((t.id.clone(), f.clone(), total, base));
+            }
+            counters.insert(t.id.clone(), std::mem::take(&mut p.counter_totals));
             p.session.match_basis = basis[&t.id].to_string();
             let key = p.session.key();
             for tid in p.turn_ids {
@@ -594,6 +653,13 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
                 .expect("codex sets transcript");
             *status.entry(tr.status.clone()).or_default() += 1;
             inherited_lines += tr.inherited_lines;
+            if tr.segments.len() > 1 {
+                segmented_threads += 1;
+                segment_files += tr.segments.len() as u64;
+            }
+            if matches!(tr.status.as_str(), "damaged" | "incomplete") {
+                damaged_counted += p.check.own_total;
+            }
             *by_basis.entry(p.session.match_basis.clone()).or_default() += 1;
             if p.session.role == "main" {
                 main += 1;
@@ -610,6 +676,8 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
                 sum_last += last;
                 sum_own += p.check.own_total;
                 sum_inh += p.check.inherited;
+                sum_untracked += p.check.untracked;
+                sum_rewound += p.check.rewound;
                 if db == last {
                     equal += 1;
                 } else {
@@ -634,12 +702,42 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
                 "sum_tokens_used": sum_db,
                 "sum_last_counter_total": sum_last,
                 "sum_inherited_at_start": sum_inh,
+                "sum_untracked_at_start": sum_untracked,
                 "sum_own_total": sum_own,
-                "own_plus_inherited_equals_last": sum_own + sum_inh == sum_last,
+                "sum_rewound": sum_rewound,
+                "own_plus_inherited_plus_untracked_minus_rewound_equals_last": sum_own + sum_inh + sum_untracked == sum_last + sum_rewound,
                 "tokens_used_overcount_factor": ratio(sum_db, sum_own),
             });
         }
         checks.insert("codex_tokens_used".into(), cmp);
+        let mut fb = BTreeMap::<&str, u64>::new();
+        for (child, parent, total, base) in &forks {
+            let outcome = match counters.get(parent) {
+                _ if *base == 0 => "zero_base",
+                None => "parent_unavailable",
+                // The first snapshot repeats a counter of the base thread:
+                // its last_token_usage is the base thread's request.
+                Some(c) if c.contains(total) => "replayed",
+                Some(c) if c.contains(base) => "verified",
+                Some(_) => "mismatched",
+            };
+            *fb.entry(outcome).or_default() += 1;
+            if matches!(outcome, "replayed" | "mismatched") {
+                let replayed = outcome == "replayed";
+                fork_findings.push(detect::Ctx { th, at: &at }.finding(
+                    "fork-baseline",
+                    if replayed { "error" } else { "warn" },
+                    &format!("codex:{child}"),
+                    if replayed {
+                        format!("the fork's first token counter repeats a counter of its base thread codex:{parent}, so its first request is the base thread's and was counted twice")
+                    } else {
+                        format!("the fork's starting counter ({base} tokens) matches no counter of its base thread codex:{parent}; the inherited/own split is unverified")
+                    },
+                    Vec::new(),
+                    json!({"base_thread": format!("codex:{parent}"), "first_counter_total": total, "starting_counter": base}),
+                ));
+            }
+        }
         codex_cov = json!({
             "present": true,
             "threads_in_db": threads.len(),
@@ -651,6 +749,17 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             "threads_without_token_counters": no_counters,
             "db_tokens_used_of_those": fallback_tokens,
             "inherited_history_lines_skipped": inherited_lines,
+            "segment_index": {"files": seg_index.files, "unreadable_dirs": seg_index.unreadable_dirs},
+            "threads_with_several_segments": segmented_threads,
+            "segment_files_of_those": segment_files,
+            "threads_with_untracked_tokens": untracked_threads,
+            "untracked_tokens": untracked_total,
+            "tokens_counted_before_damage_excluded": damaged_counted,
+            "unparseable_token_counters": unparseable,
+            "multi_request_increments": multi_inc,
+            "multi_request_increments_tier_differs": multi_tier,
+            "fork_baselines": fb,
+            "segment_rewinds": {"count": rewinds, "starting_counter_unmatched": rewinds_unmatched, "rewound_tokens": rewound_total},
             "unselected_threads_with_project_dir_name_in_cwd": elsewhere,
         });
     } else {
@@ -662,6 +771,10 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
     inputs.insert(
         "codex_archive",
         json!({"path": display_path(&inp.codex_archive), "present": inp.codex_archive.is_dir()}),
+    );
+    inputs.insert(
+        "codex_sessions",
+        json!({"path": display_path(&inp.codex_sessions), "present": inp.codex_sessions.is_dir()}),
     );
     coverage.insert("codex".into(), codex_cov);
 
@@ -832,7 +945,28 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             }
             _ => "empty".into(),
         };
-        for s in sessions.iter_mut().filter(|s| s.source == "claude") {
+        // Main sessions first: a subagent runs under its session's billing
+        // route, decided when that session started.
+        let mut main_billing: HashMap<String, crate::session::Billing> = HashMap::new();
+        let mut inherited = 0u64;
+        let mut order: Vec<usize> = (0..sessions.len())
+            .filter(|i| sessions[*i].source == "claude")
+            .collect();
+        order.sort_by_key(|i| sessions[*i].role != "main");
+        for i in order {
+            let s = &mut sessions[i];
+            if s.role == "subagent"
+                && let Some(main) = s.id.split('/').next()
+                && let Some(b) = main_billing.get(main)
+            {
+                s.billing.mode = b.mode.clone();
+                s.billing.basis = format!("inherited from its session claude:{main}: {}", b.basis);
+                inherited += 1;
+                if b.mode != "unknown" {
+                    *matched.entry(b.mode.clone()).or_default() += 1;
+                }
+                continue;
+            }
             let Some((cwd, start)) = claude_raw.get(&s.key()) else {
                 continue;
             };
@@ -857,6 +991,13 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
                     );
                 }
             }
+            if s.role == "subagent" {
+                s.billing
+                    .basis
+                    .push_str("; its session is not in the scan, so its own first record was used");
+            } else {
+                main_billing.insert(s.id.clone(), s.billing.clone());
+            }
         }
         billing_cov = json!({
             "present": true,
@@ -865,6 +1006,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             "range": range,
             "decisions_in_project": log.in_project(root),
             "claude_sessions_matched_by_mode": matched,
+            "claude_subagents_inheriting_session_billing": inherited,
         });
         inputs.insert(
             "billing_log",
@@ -901,6 +1043,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             .extend(tr.intervals.iter().copied());
     }
     findings.extend(detect::cross_session(&sessions, &dcx));
+    findings.extend(fork_findings);
 
     // ---- Active time without overlap.
     let mut union = BTreeMap::new();
@@ -914,6 +1057,10 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
         union.insert(src, union_ms(iv));
     }
     let union_native = union_ms(native);
+    let mut active_unknown = BTreeMap::<&str, u64>::new();
+    for s in sessions.iter().filter(|s| s.active_ms.is_none()) {
+        *active_unknown.entry(s.source.as_str()).or_default() += 1;
+    }
     let union_all = union_ms(all);
 
     // ---- Write.
@@ -946,6 +1093,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             "claude_and_codex": union_native,
             "all_sources": union_all,
             "basis": "union of the sessions' turn intervals (claude, codex) or run intervals (t3), so concurrent sessions are not double counted",
+            "sessions_with_unknown_active_time": active_unknown,
         },
         "sessions": sessions.len(),
         "findings": findings.len(),

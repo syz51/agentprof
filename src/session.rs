@@ -175,12 +175,22 @@ pub struct Billing {
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Transcript {
     pub path: Option<String>,
-    /// `present`, `zstd`, `missing`.
+    /// `present`, `zstd`, `missing`, `unreadable` (Claude: the file could
+    /// not be read), `damaged` (Codex: a segment failed to open or
+    /// decompress part-way) or `incomplete` (Codex: earlier segments exist
+    /// but the recorded newest one does not).
     pub status: String,
     pub lines: u64,
     pub bad_lines: u64,
     /// Codex lines copied from the parent thread's history and skipped.
     pub inherited_lines: u64,
+    /// Codex rollout segment files read, oldest first, when there is more
+    /// than the recorded one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<String>,
+    /// The read error for a `damaged` or `unreadable` transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
@@ -250,8 +260,13 @@ pub struct Session {
     /// history). Never added to totals.
     pub db_tokens_used: Option<u64>,
     /// Codex counter value inherited from the base thread at the start of
-    /// the rollout, excluded from `total`.
+    /// a forked thread's rollout, excluded from `total`.
     pub inherited_tokens: Option<u64>,
+    /// Codex counter value at the start of a thread that was not forked:
+    /// the thread's own usage in records that are missing or unreadable.
+    /// Excluded from `total`, so the thread's totals are a lower bound.
+    #[serde(default)]
+    pub untracked_tokens: Option<u64>,
     pub max_prompt_tokens: Option<u64>,
     pub context_window: Option<u64>,
     pub tools: BTreeMap<String, ToolStat>,
@@ -301,6 +316,7 @@ impl Session {
             by_day: BTreeMap::new(),
             db_tokens_used: None,
             inherited_tokens: None,
+            untracked_tokens: None,
             max_prompt_tokens: None,
             context_window: None,
             tools: BTreeMap::new(),
