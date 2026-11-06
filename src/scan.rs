@@ -146,8 +146,28 @@ struct Inputs {
     config: Option<PathBuf>,
 }
 
+/// The absolute form of `p` with `.` and `..` removed lexically (symlinks
+/// are kept, so a root matches the working directories agents recorded).
+fn absolute_clean(p: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let abs = std::path::absolute(p).with_context(|| format!("resolving {}", p.display()))?;
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
 fn resolve(a: &ScanArgs) -> Result<Inputs> {
-    let config = find_config(a.config.as_deref())?;
+    let config = find_config(a.config.as_deref())?
+        .map(|p| absolute_clean(&p))
+        .transpose()?;
     let (cfg, base): (ResearchToml, Option<PathBuf>) = match &config {
         Some(p) => {
             let text =
@@ -165,7 +185,7 @@ fn resolve(a: &ScanArgs) -> Result<Inputs> {
         })
     };
     let root = match (&a.project, &base) {
-        (Some(p), _) => std::path::absolute(p)?,
+        (Some(p), _) => absolute_clean(p)?,
         (None, Some(b)) => b.clone(),
         (None, None) => bail!("no --project given and no research.toml found"),
     };
@@ -296,18 +316,21 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
     let mut traces: HashMap<String, Trace> = HashMap::new();
 
     // ---- T3 first: its links widen the Claude and Codex selections.
+    let mut t3_absent: Option<String> = None;
     let t3data = if inp.t3_db.is_file() {
         let (conn, mode) = t3::open(&inp.t3_db)?;
         inputs.insert(
             "t3_db",
             json!({"path": display_path(&inp.t3_db), "open": mode}),
         );
-        Some(t3::load(
-            &conn,
-            inp.t3_project.as_deref(),
-            root,
-            a.include_titles,
-        )?)
+        let d = t3::load(&conn, inp.t3_project.as_deref(), root, a.include_titles)?;
+        if d.is_none() {
+            t3_absent = Some(format!(
+                "no T3 project has workspace root {}; pass --t3-project to choose one",
+                tilde(root)
+            ));
+        }
+        d
     } else {
         inputs.insert(
             "t3_db",
@@ -643,7 +666,10 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
     coverage.insert("codex".into(), codex_cov);
 
     // ---- Link T3 threads to native sessions.
-    let mut t3_cov = json!({"present": false});
+    let mut t3_cov = match &t3_absent {
+        Some(reason) => json!({"present": false, "reason": reason}),
+        None => json!({"present": false}),
+    };
     if let Some(data) = t3data {
         let index: HashMap<String, usize> = sessions
             .iter()

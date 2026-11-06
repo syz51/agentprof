@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
 use crate::session::{Session, Spawn, T3Info};
@@ -168,11 +168,13 @@ struct ProviderTurnPayload {
 }
 
 /// Finds the project by id, or by a workspace root equal to `project_root`.
+/// `None` when no id was given and no project has that root: T3 simply has
+/// no record of this project. An explicit id that does not exist is an error.
 fn find_project(
     conn: &Connection,
     id: Option<&str>,
     project_root: &str,
-) -> Result<(String, Option<String>)> {
+) -> Result<Option<(String, Option<String>)>> {
     if let Some(id) = id {
         let root: Option<Option<String>> = conn
             .query_row(
@@ -180,8 +182,12 @@ fn find_project(
                 [id],
                 |r| r.get(0),
             )
-            .ok();
-        return Ok((id.to_string(), root.flatten()));
+            .optional()
+            .with_context(|| format!("looking up T3 project {id}"))?;
+        let Some(root) = root else {
+            bail!("T3 project {id} not found");
+        };
+        return Ok(Some((id.to_string(), root)));
     }
     let mut st = conn.prepare(
         "select project_id, workspace_root from projection_projects
@@ -191,8 +197,8 @@ fn find_project(
         .query_map([project_root], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     match rows.len() {
-        0 => bail!("no T3 project has workspace root {project_root}; pass --t3-project"),
-        1 => Ok(rows.into_iter().next().expect("one row")),
+        0 => Ok(None),
+        1 => Ok(rows.into_iter().next()),
         n => bail!("{n} T3 projects have workspace root {project_root}; pass --t3-project"),
     }
 }
@@ -202,8 +208,10 @@ pub fn load(
     project_id: Option<&str>,
     project_root: &str,
     include_titles: bool,
-) -> Result<T3Data> {
-    let (pid, root) = find_project(conn, project_id, project_root)?;
+) -> Result<Option<T3Data>> {
+    let Some((pid, root)) = find_project(conn, project_id, project_root)? else {
+        return Ok(None);
+    };
 
     let mut st = conn.prepare(
         "select thread_id, title, default_provider, created_at, updated_at, archived_at, deleted_at, payload_json
@@ -336,10 +344,10 @@ pub fn load(
                 s.aborts += 1;
             }
         }
-        s.turns = Some(runs);
+        s.turns = (runs > 0).then_some(runs);
         s.open_turns = info.runs_by_status.get("running").copied().unwrap_or(0);
         if runs > 0 {
-            s.active_ms = Some(active);
+            s.active_ms = (timed > 0).then_some(active);
             if timed < runs {
                 s.notes.push(format!(
                     "{} run(s) lack a start or completion time",
@@ -444,12 +452,12 @@ pub fn load(
         sql_runs.entry(p).or_default().insert(s, n as u64);
     }
 
-    Ok(T3Data {
+    Ok(Some(T3Data {
         project_id: pid,
         workspace_root: root,
         threads,
         sql_runs,
-    })
+    }))
 }
 
 pub fn open(path: &Path) -> Result<(Connection, &'static str)> {

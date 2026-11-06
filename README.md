@@ -50,10 +50,10 @@ Flags:
 
 | Flag | Default |
 |---|---|
-| `--project` | The directory of `research.toml`. |
+| `--project` | The directory of `research.toml`. Relative paths resolve against the cwd; `.` and `..` are removed, symlinks are kept. |
 | `--out` | `[agentprof] out`. One of the two is required. |
 | `--config` | Searches upwards from the cwd for `research.toml`. |
-| `--t3-project` | The T3 project whose workspace root is the project root. |
+| `--t3-project` | The T3 project whose workspace root is the project root. Without the flag, no such project means T3 is absent for this project (`coverage.t3.reason`). A given id that does not exist is an error. |
 | `--claude-dir` | `~/.claude/projects` |
 | `--codex-db` | `~/.codex/state_5.sqlite` |
 | `--codex-archive` | `~/.codex/archived_sessions` |
@@ -98,7 +98,7 @@ Every cost is labelled an API-equivalent estimate. Time and turn sums skip sessi
 |---|---|
 | 0 | No `error` finding. |
 | 1 | At least one `error` finding. |
-| 2 | Usage error, or an I/O or parse failure that stops the scan. |
+| 2 | Usage error, a `--t3-project` id that does not exist, or an I/O or parse failure that stops the scan. |
 
 ## `research.toml`
 

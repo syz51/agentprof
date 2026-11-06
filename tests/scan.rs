@@ -444,6 +444,8 @@ fn scan_and_report_end_to_end() {
         "{md}"
     );
     assert!(md.contains("run-failed"));
+    // T3 has one thread without runs: its turns and times are unknown, not 0.
+    assert!(md.contains("| t3 | 5 | 0 | 6 (1 unknown) |"), "{md}");
 
     // Privacy: no message text, tool output or titles anywhere in the outputs.
     for name in ["sessions.jsonl", "findings.jsonl", "scan.json"] {
@@ -517,6 +519,98 @@ fn scan(root: &Path, args: &[&str]) -> std::process::Output {
         .args(["--timezone", "UTC", "--billing-log", "/nonexistent/c.jsonl"])
         .output()
         .unwrap()
+}
+
+fn scan_json(out: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(out.join("scan.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn t3_without_the_project_is_absent_and_a_wrong_t3_project_exits_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let claude = claude_tree(root);
+    let t3 = t3_db(root);
+    let out = root.join("out");
+    let common = |extra: &[&str]| {
+        let mut v = vec![
+            "--out",
+            out.to_str().unwrap(),
+            "--claude-dir",
+            claude.to_str().unwrap(),
+            "--codex-db",
+            "/nonexistent/a.sqlite",
+            "--t3-db",
+            t3.to_str().unwrap(),
+        ];
+        v.extend_from_slice(extra);
+        v.into_iter().map(String::from).collect::<Vec<_>>()
+    };
+    let a = common(&["--project", "/work/no-t3-project"]);
+    let res = scan(root, &a.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let cov = &scan_json(&out)["coverage"]["t3"];
+    assert_eq!(cov["present"], false);
+    assert!(cov["reason"].as_str().unwrap().contains("no T3 project"));
+
+    let a = common(&["--project", "/work/proj", "--t3-project", "p-typo"]);
+    let res = scan(root, &a.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(res.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&res.stderr).contains("T3 project p-typo not found"));
+}
+
+#[test]
+fn relative_config_and_dotdot_project_resolve_to_the_real_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Canonical, so the recorded cwd matches the process's working directory.
+    let base = tmp.path().canonicalize().unwrap();
+    let repo = base.join("repo");
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    std::fs::write(repo.join("research.toml"), "[agentprof]\nout = \"out\"\n").unwrap();
+    let projects = base.join("claude");
+    std::fs::create_dir_all(projects.join("-x")).unwrap();
+    std::fs::write(
+        projects.join("-x/s1.jsonl"),
+        format!(
+            r#"{{"type":"assistant","uuid":"a","requestId":"r","sessionId":"s1","cwd":"{}","timestamp":"2026-01-01T00:00:00Z","message":{{"id":"m","model":"claude-haiku-5-5","content":[],"usage":{{"input_tokens":1,"output_tokens":1}}}}}}
+"#,
+            repo.display()
+        ),
+    )
+    .unwrap();
+    let common = [
+        "--claude-dir",
+        projects.to_str().unwrap(),
+        "--codex-db",
+        "/nonexistent/a.sqlite",
+        "--t3-db",
+        "/nonexistent/b.sqlite",
+    ];
+    let mut a = vec!["--config", "research.toml"];
+    a.extend_from_slice(&common);
+    let res = scan(&repo, &a);
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let rows = read_jsonl(&repo.join("out/sessions.jsonl"));
+    assert_eq!(rows.len(), 1);
+    assert_ne!(scan_json(&repo.join("out"))["project"], "/");
+
+    let out2 = base.join("out2");
+    let mut a = vec!["--project", "..", "--out", out2.to_str().unwrap()];
+    a.extend_from_slice(&common);
+    let res = scan(&repo.join("sub"), &a);
+    assert_eq!(res.status.code(), Some(0));
+    assert_eq!(read_jsonl(&out2.join("sessions.jsonl")).len(), 1);
+    assert!(!scan_json(&out2)["project"].as_str().unwrap().contains(".."));
 }
 
 #[test]
