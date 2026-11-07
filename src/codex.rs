@@ -187,6 +187,9 @@ pub struct Index {
     by_thread: HashMap<String, Vec<(String, String, Rollout)>>,
     pub files: u64,
     pub unreadable_dirs: u64,
+    /// Directory entries whose type could not be read; a segment among them
+    /// is not found.
+    pub unreadable_entries: u64,
 }
 
 impl Index {
@@ -205,9 +208,11 @@ impl Index {
                     ix.unreadable_dirs += 1;
                     continue;
                 };
-                for e in rd.flatten() {
-                    let p = e.path();
-                    let Ok(ft) = e.file_type() else { continue };
+                for e in rd {
+                    let Ok((p, ft)) = e.and_then(|e| Ok((e.path(), e.file_type()?))) else {
+                        ix.unreadable_entries += 1;
+                        continue;
+                    };
                     if ft.is_dir() {
                         stack.push(p);
                         continue;
@@ -442,7 +447,13 @@ fn read_range(cmd: Option<&str>) -> String {
             let range = script.and_then(|sc| {
                 let body = sc.strip_suffix('p')?;
                 let (a, b) = body.split_once(',').unwrap_or((body, body));
-                let (a, b) = (a.parse::<u64>().ok()?, b.parse::<u64>().ok()?);
+                let number = |s: &str| {
+                    s.bytes()
+                        .all(|c| c.is_ascii_digit())
+                        .then(|| s.parse::<u64>().ok())
+                        .flatten()
+                };
+                let (a, b) = (number(a)?, number(b)?);
                 Some(format!("lines {a}-{b}"))
             });
             range.unwrap_or_else(|| format!("cmd:{cmd}"))
@@ -677,6 +688,19 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
             }
         };
         let offset = ln;
+        if !tr.segments.is_empty() {
+            // A turn or tool call left open when the previous segment ended
+            // is not timed across the gap before the resume.
+            if let (Some(st), Some(lt)) = (turn_open.take(), last_ts) {
+                open_turns += 1;
+                active += (lt - st).max(0);
+                timed += 1;
+                tr.intervals.push((st, lt));
+            }
+            for call in pending.values_mut() {
+                call.1 = None;
+            }
+        }
         tr.segments.push((offset, seg_path.clone()));
         // The first counter of a later segment may restart from the counter
         // value before the turn the segment resumes.
@@ -831,11 +855,19 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
                             let cur = info.total_token_usage;
                             let last = info.last_token_usage;
                             let resumed = std::mem::take(&mut segment_start);
+                            // A later segment that first repeats an earlier
+                            // counter restores that state without a request.
+                            let restored = resumed
+                                && prev.is_some_and(|p| p != cur)
+                                && counter_totals.contains(&cur.total_tokens);
                             // A later segment whose first request starts below
                             // the previous counter resumes an earlier state: the
                             // rolled-back requests were used and stay counted,
                             // and this request counts as itself.
                             let rewound = match (prev, cur.minus(&last)) {
+                                (Some(p), _) if restored => {
+                                    p.minus(&cur).map(|r| (r, cur.total_tokens))
+                                }
                                 (Some(p), Some(base)) if resumed && base != p && cur != p => {
                                     p.minus(&base).map(|r| (r, base.total_tokens))
                                 }
@@ -851,6 +883,10 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
                             check.last_total = Some(cur.total_tokens);
                             counter_totals.push(cur.total_tokens);
                             let delta = match prev {
+                                Some(_) if restored => {
+                                    check.duplicate_events += 1;
+                                    None
+                                }
                                 Some(_) if rewound.is_some() => Some(last),
                                 None => {
                                     // The counter may start above zero: a fork's
@@ -901,6 +937,9 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
                             } else {
                                 None
                             };
+                            if usd.is_some_and(|c| c.long_context) {
+                                tr.long_context.push((prompt, ln));
+                            }
                             total.add_request(&tokens, usd);
                             s.by_model.entry(m).or_default().add_request(&tokens, usd);
                             s.by_effort
@@ -1171,6 +1210,9 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
         s.set_span(start.or(th.created_ms), end.or(th.updated_ms));
     }
     s.finish_cost(&basis, 0.0);
+    if transcript.segments.len() == 1 && transcript.path.as_ref() == transcript.segments.first() {
+        transcript.segments.clear();
+    }
     s.transcript = Some(transcript);
     Parsed {
         session: s,
@@ -1634,6 +1676,79 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_segment_that_repeats_an_earlier_counter_adds_no_request() {
+        let dir = tempfile::tempdir().unwrap();
+        // Segment 2 resumes before segment 1's second request: it first
+        // repeats the restored counter (1000), then continues with 500.
+        let s1 = rollout(&[
+            meta(0, "tP", ""),
+            tc(1, "2026-01-01T00:00:01Z", [1000, 0, 0, 0], [1000, 0, 0, 0]),
+            tc(2, "2026-01-01T00:00:02Z", [1600, 0, 0, 0], [600, 0, 0, 0]),
+        ]);
+        let s2 = rollout(&[
+            meta(2, "tP", ""),
+            tc(3, "2026-01-01T00:01:00Z", [1000, 0, 0, 0], [1000, 0, 0, 0]),
+            tc(4, "2026-01-01T00:01:01Z", [1500, 0, 0, 0], [500, 0, 0, 0]),
+        ]);
+        let names = [
+            seg_name("2026-01-01T00-00-00", "tP", None),
+            seg_name("2026-01-01T00-01-00", "tP", Some("s2")),
+        ];
+        for (n, body) in names.iter().zip([&s1, &s2]) {
+            std::fs::write(dir.path().join(n), body).unwrap();
+        }
+        let mut th = thread("tP", "vscode");
+        th.rollout_path = dir.path().join(&names[1]).to_string_lossy().into();
+        let segs = Index::build(&[dir.path()]).segments("tP", resolve(&th.rollout_path, None));
+        let pr = Pricing::load(None).unwrap();
+        let p = parse(&th, &segs, &cx(&pr));
+        assert_eq!(p.check.own_total, 1000 + 600 + 500);
+        assert_eq!(p.session.total.as_ref().unwrap().requests, 3);
+        assert_eq!((p.check.rewinds, p.check.rewinds_unmatched), (1, 0));
+        assert_eq!(p.check.rewound, 600);
+        assert_eq!(
+            p.check.own_total + p.check.untracked,
+            p.check.last_total.unwrap() + p.check.rewound
+        );
+    }
+
+    #[test]
+    fn a_turn_open_at_a_segment_end_is_not_timed_across_the_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let s1 = rollout(&[
+            meta(0, "tG", ""),
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","ordinal":1,"payload":{"type":"task_started","turn_id":"u1"}}"#.into(),
+            tc(2, "2026-01-01T00:00:05Z", [1000, 0, 0, 0], [1000, 0, 0, 0]),
+        ]);
+        // Two days later.
+        let s2 = rollout(&[
+            meta(3, "tG", ""),
+            r#"{"timestamp":"2026-01-03T00:00:00Z","type":"turn_context","ordinal":4,"payload":{"turn_id":"u2","model":"gpt-6.1-sol"}}"#.into(),
+            r#"{"timestamp":"2026-01-03T00:00:00Z","type":"event_msg","ordinal":5,"payload":{"type":"task_started","turn_id":"u2"}}"#.into(),
+            r#"{"timestamp":"2026-01-03T00:00:02Z","type":"event_msg","ordinal":6,"payload":{"type":"task_complete","turn_id":"u2","duration_ms":2000}}"#.into(),
+        ]);
+        let names = [
+            seg_name("2026-01-01T00-00-00", "tG", None),
+            seg_name("2026-01-03T00-00-00", "tG", Some("s2")),
+        ];
+        for (n, body) in names.iter().zip([&s1, &s2]) {
+            std::fs::write(dir.path().join(n), body).unwrap();
+        }
+        let mut th = thread("tG", "vscode");
+        th.rollout_path = dir.path().join(&names[1]).to_string_lossy().into();
+        let segs = Index::build(&[dir.path()]).segments("tG", resolve(&th.rollout_path, None));
+        let pr = Pricing::load(None).unwrap();
+        let p = parse(&th, &segs, &cx(&pr));
+        assert_eq!(p.session.active_ms, Some(5000 + 2000));
+        assert_eq!(p.session.open_turns, 1);
+        assert_eq!(p.session.transcript.as_ref().unwrap().segments.len(), 2);
+
+        // One segment: no segments list repeating the path.
+        let one = parse(&th, &segs[1..], &cx(&pr));
+        assert!(one.session.transcript.as_ref().unwrap().segments.is_empty());
+    }
+
+    #[test]
     fn missing_recorded_segment_makes_tokens_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let n1 = seg_name("2026-01-01T00-00-00", "tM", None);
@@ -1747,6 +1862,11 @@ mod tests {
         assert_eq!(read_range(Some("cat a.rs")), "whole");
         assert_eq!(read_range(Some("nl -ba a.rs")), "whole");
         assert_eq!(read_range(Some("tail -n 5 a.rs")), "cmd:tail -n 5 a.rs");
+        // A GNU relative range is not lines 1-5.
+        assert_eq!(
+            read_range(Some("sed -n '1,+5p' a.rs")),
+            "cmd:sed -n '1,+5p' a.rs"
+        );
         let mut tr = Trace::default();
         for (i, r) in ["lines 1-200", "lines 201-400", "lines 1-200"]
             .iter()

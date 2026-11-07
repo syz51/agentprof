@@ -123,8 +123,34 @@ impl Pricing {
                 bail!("model {} is listed twice", m.model);
             }
             let rates = [m.input, m.cache_read, m.output];
-            if rates.iter().any(|r| !r.is_finite() || *r < 0.0) {
+            let optional = [m.cache_write_5m, m.cache_write_1h];
+            if rates
+                .iter()
+                .chain(optional.iter().flatten())
+                .any(|r| !r.is_finite() || *r < 0.0)
+            {
                 bail!("model {} has a negative or non-finite price", m.model);
+            }
+            // The surcharge is the tier's cost minus the standard cost of the
+            // same tokens, so each tier price needs a standard price it is at
+            // least as high as.
+            if let Some(lc) = &m.long_context {
+                let pairs = [
+                    (Some(lc.input), Some(m.input)),
+                    (lc.cache_write_5m, m.cache_write_5m),
+                    (lc.cache_write_1h, m.cache_write_1h),
+                    (Some(lc.cache_read), Some(m.cache_read)),
+                    (Some(lc.output), Some(m.output)),
+                ];
+                for (tier, standard) in pairs {
+                    let Some(tier) = tier else { continue };
+                    if !tier.is_finite() || standard.is_none_or(|s| tier < s) {
+                        bail!(
+                            "model {}: each long_context price must be finite, have a standard price, and be at least that price",
+                            m.model
+                        );
+                    }
+                }
             }
             if m.source.is_empty() || m.checked.is_empty() {
                 bail!("model {} lacks a source or checked date", m.model);
@@ -145,7 +171,9 @@ impl Pricing {
 
     /// API-equivalent cost of one request, or `None` when it cannot be
     /// established: unknown model, a token class without a price, or cache
-    /// writes of unknown TTL. `multiplier` applies documented surcharges such
+    /// writes of unknown TTL. [`Pricing::parse`] ensures a tier prices only
+    /// classes the standard rates price, so the standard cost always exists
+    /// when the tier's does. `multiplier` applies documented surcharges such
     /// as Anthropic's US-only inference (1.1). The result also says how much
     /// the long-context tier added: the cost at the tier minus the same tokens
     /// at the standard rates. A request at or below the threshold, or a model
@@ -208,7 +236,7 @@ impl Pricing {
             .collect();
         let checked: Vec<&str> = checked.into_iter().collect();
         format!(
-            "API-equivalent estimate: per-request tokens x {provider} standard-tier list prices in pricing.toml (checked {}); not an invoice",
+            "API-equivalent estimate: per-request tokens x {provider} standard service tier list prices in pricing.toml, at the long-context rates for prompts over a model's threshold (checked {}); not an invoice",
             if checked.is_empty() {
                 "never".to_string()
             } else {
@@ -386,5 +414,21 @@ source = "s"
 checked = "d"
 "#;
         assert!(Pricing::parse(text).is_err());
+    }
+
+    #[test]
+    fn long_context_prices_need_a_standard_price_they_exceed() {
+        let row = |standard: &str, tier: &str| {
+            format!(
+                "schema = \"agentprof.pricing/1\"\n[[model]]\nprovider = \"x\"\nmodel = \"m\"\ninput = 1.0\ncache_read = 0.1\noutput = 2.0\n{standard}source = \"s\"\nchecked = \"d\"\n[model.long_context]\nthreshold_tokens = 10\ninput = 2.0\ncache_read = 0.2\noutput = 3.0\n{tier}"
+            )
+        };
+        assert!(Pricing::parse(&row("", "")).is_ok());
+        assert!(Pricing::parse(&row("cache_write_5m = 1.25\n", "cache_write_5m = 2.5\n")).is_ok());
+        // A tier price for a class the standard rates leave unpriced.
+        assert!(Pricing::parse(&row("", "cache_write_5m = 2.5\n")).is_err());
+        // A tier price below the standard one would make the surcharge negative.
+        assert!(Pricing::parse(&row("cache_write_5m = 1.25\n", "cache_write_5m = 1.0\n")).is_err());
+        assert!(Pricing::parse(&row("cache_write_5m = -1.0\n", "")).is_err());
     }
 }

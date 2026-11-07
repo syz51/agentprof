@@ -88,6 +88,10 @@ impl Acc {
         }
     }
 
+    pub fn priced_requests(&self) -> u64 {
+        self.requests - self.unpriced_requests
+    }
+
     pub fn merge(&mut self, o: &Acc) {
         self.requests += o.requests;
         self.tokens.add(&o.tokens);
@@ -175,20 +179,19 @@ pub struct Billing {
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Transcript {
     pub path: Option<String>,
-    /// `present`, `zstd`, `missing`, `unreadable` (Claude: the file could
-    /// not be read), `damaged` (Codex: a segment failed to open or
-    /// decompress part-way) or `incomplete` (Codex: earlier segments exist
+    /// `present`, `zstd`, `missing`, `damaged` (Codex: a segment failed to
+    /// open or decompress part-way) or `incomplete` (Codex: earlier segments exist
     /// but the recorded newest one does not).
     pub status: String,
     pub lines: u64,
     pub bad_lines: u64,
     /// Codex lines copied from the parent thread's history and skipped.
     pub inherited_lines: u64,
-    /// Codex rollout segment files read, oldest first, when there is more
-    /// than the recorded one.
+    /// Codex rollout segment files read, oldest first, when there are several
+    /// or the recorded newest one is missing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub segments: Vec<String>,
-    /// The read error for a `damaged` or `unreadable` transcript.
+    /// The read error for a `damaged` transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

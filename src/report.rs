@@ -199,7 +199,7 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
     );
     let _ = writeln!(
         o,
-        "**Every cost here is an API-equivalent estimate**: the tokens each request used, priced at the provider's standard-tier list price from `pricing.toml`. It is not an invoice, and it ignores subscriptions. A cost reads \"unknown\" when any request in it has no verified price; the figure after \"≥\" covers the priced requests only.\n"
+        "**Every cost here is an API-equivalent estimate**: the tokens each request used, priced at the provider's list price for the standard service tier from `pricing.toml` (at the long-context rates for prompts over a model's threshold; see Long-context pricing). It is not an invoice, and it ignores subscriptions. A cost reads \"unknown\" when any request in it has no verified price; the figure after \"≥\" covers the priced requests only.\n"
     );
     let _ = writeln!(o, "- Anthropic: {}", s_(g(&["pricing", "anthropic_basis"])));
     let _ = writeln!(o, "- OpenAI: {}\n", s_(g(&["pricing", "openai_basis"])));
@@ -286,6 +286,7 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
     let _ = writeln!(o);
 
     // ---- By model, effort, day.
+    let mut by_model: BTreeMap<(String, String), Acc> = BTreeMap::new();
     for (title, key) in [("By model", 0), ("By reasoning effort", 1), ("By day", 2)] {
         let mut m: BTreeMap<(String, String), Acc> = BTreeMap::new();
         for s in sessions.iter().filter(|s| s.source != "t3") {
@@ -318,17 +319,12 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
             acc_row(&mut o, &name, a);
         }
         let _ = writeln!(o);
+        if key == 0 {
+            by_model = m;
+        }
     }
 
     // ---- Long-context pricing.
-    let mut lc: BTreeMap<(String, String), Acc> = BTreeMap::new();
-    for s in sessions.iter().filter(|s| s.source != "t3") {
-        for (k, a) in &s.by_model {
-            lc.entry((s.source.clone(), k.clone()))
-                .or_default()
-                .merge(a);
-        }
-    }
     let mut lc_total = Acc::default();
     let _ = writeln!(o, "## Long-context pricing\n");
     let _ = writeln!(
@@ -337,10 +333,10 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
     );
     let _ = writeln!(
         o,
-        "| Source / model | Priced requests | Over the threshold | Share | Surcharge | Cost |\n|---|---:|---:|---:|---:|---:|"
+        "| Source / model | Priced requests | Over the threshold | Share | Surcharge | Cost of all requests |\n|---|---:|---:|---:|---:|---:|"
     );
-    for ((src, model), a) in lc.iter().filter(|(_, a)| a.long_context_requests > 0) {
-        let priced = a.requests - a.unpriced_requests;
+    for ((src, model), a) in by_model.iter().filter(|(_, a)| a.long_context_requests > 0) {
+        let priced = a.priced_requests();
         let _ = writeln!(
             o,
             "| {src} / {model} | {} | {} | {} | ${:.2} | {} |",
@@ -355,7 +351,7 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
     if lc_total.long_context_requests == 0 {
         let _ = writeln!(o, "| none | – | 0 | – | $0.00 | – |");
     } else {
-        let priced = lc_total.requests - lc_total.unpriced_requests;
+        let priced = lc_total.priced_requests();
         let _ = writeln!(
             o,
             "| **all models above** | {} | {} | {} | ${:.2} | {} |",

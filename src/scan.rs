@@ -256,6 +256,22 @@ fn resolve(a: &ScanArgs) -> Result<Inputs> {
 }
 
 /// True when some `"cwd":"<root>` occurrence ends at a path boundary.
+/// How a fork's first counter (`total`, starting from `base`) relates to its
+/// base thread's counters.
+fn fork_outcome(parent: Option<&Vec<u64>>, total: u64, base: u64) -> &'static str {
+    match parent {
+        // The first snapshot repeats a counter of the base thread with a
+        // request in it: its last_token_usage is the base thread's request.
+        // Checked before a zero base, which a replay of the base thread's
+        // first counter also has.
+        Some(c) if total != base && c.contains(&total) => "replayed",
+        _ if base == 0 => "zero_base",
+        None => "parent_unavailable",
+        Some(c) if c.contains(&base) => "verified",
+        Some(_) => "mismatched",
+    }
+}
+
 fn mentions_cwd(text: &str, needle: &str) -> bool {
     text.match_indices(needle)
         .any(|(i, _)| matches!(text.as_bytes().get(i + needle.len()), Some(b'"' | b'/')))
@@ -373,7 +389,15 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
         let needle = claude::cwd_needle(root);
         let mut included_main: HashSet<String> = HashSet::new();
         let mut files_scanned = 0u64;
+        // Unreadable transcripts cannot be matched to a project by content.
+        // Those in the project's own directory are listed; the rest are only
+        // counted, so other projects' names stay out of this project's output.
+        let own_dir: String = root
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
         let mut unreadable: Vec<String> = Vec::new();
+        let mut unreadable_elsewhere = 0u64;
         let mut invalid_utf8_lines = 0u64;
         let mut seen = HashMap::new();
         let mut cx = claude::Ctx {
@@ -391,7 +415,16 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             let bytes = match std::fs::read(&c.path) {
                 Ok(b) => b,
                 Err(e) => {
-                    unreadable.push(format!("{}: {e}", display_path(&c.path)));
+                    let dir = c
+                        .path
+                        .strip_prefix(&inp.claude_dir)
+                        .ok()
+                        .and_then(|p| p.components().next());
+                    if dir.is_some_and(|d| d.as_os_str() == own_dir.as_str()) {
+                        unreadable.push(format!("{}: {e}", display_path(&c.path)));
+                    } else {
+                        unreadable_elsewhere += 1;
+                    }
                     continue;
                 }
             };
@@ -430,8 +463,12 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             for u in p.uuids {
                 uuid_owner.entry(u).or_insert_with(|| key.clone());
             }
+            // The first transcript holding a tool use owns it: a later one
+            // may hold a copy of its parent's history.
             for t in p.tool_use_ids {
-                tool_use_owner.insert(t, p.session.id.clone());
+                tool_use_owner
+                    .entry(t)
+                    .or_insert_with(|| p.session.id.clone());
             }
             if let Some(t) = p.parent_tool_use {
                 parent_tool.push((sessions.len(), t));
@@ -490,8 +527,9 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             "lines": claude_stats.lines,
             "bad_lines": claude_stats.bad_lines,
             "invalid_utf8_lines": invalid_utf8_lines,
-            "unreadable_files": unreadable.len(),
+            "unreadable_files": unreadable.len() as u64 + unreadable_elsewhere,
             "unreadable": unreadable,
+            "unreadable_in_other_project_dirs": unreadable_elsewhere,
             "subagent_parent_mismatch": parent_mismatch,
             "subagent_parent_unverified": parent_unverified,
             "subagent_parent_nested": parent_nested,
@@ -585,7 +623,11 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             context_ratio: th.context_ratio,
         };
         // Earlier segments of resumed threads are not in the database.
-        let seg_index = codex::Index::build(&[&inp.codex_sessions, &inp.codex_archive]);
+        let seg_index = if selected.is_empty() {
+            codex::Index::default()
+        } else {
+            codex::Index::build(&[&inp.codex_sessions, &inp.codex_archive])
+        };
         let next = AtomicUsize::new(0);
         let results: Mutex<Vec<(usize, codex::Parsed)>> = Mutex::new(Vec::new());
         std::thread::scope(|sc| {
@@ -666,7 +708,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             } else {
                 sub += 1;
             }
-            if p.session.total.is_none() {
+            if p.session.total.is_none() && p.check.token_events == 0 {
                 no_counters += 1;
                 fallback_tokens += p.session.db_tokens_used.unwrap_or(0);
             }
@@ -712,15 +754,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
         checks.insert("codex_tokens_used".into(), cmp);
         let mut fb = BTreeMap::<&str, u64>::new();
         for (child, parent, total, base) in &forks {
-            let outcome = match counters.get(parent) {
-                _ if *base == 0 => "zero_base",
-                None => "parent_unavailable",
-                // The first snapshot repeats a counter of the base thread:
-                // its last_token_usage is the base thread's request.
-                Some(c) if c.contains(total) => "replayed",
-                Some(c) if c.contains(base) => "verified",
-                Some(_) => "mismatched",
-            };
+            let outcome = fork_outcome(counters.get(parent), *total, *base);
             *fb.entry(outcome).or_default() += 1;
             if matches!(outcome, "replayed" | "mismatched") {
                 let replayed = outcome == "replayed";
@@ -749,7 +783,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             "threads_without_token_counters": no_counters,
             "db_tokens_used_of_those": fallback_tokens,
             "inherited_history_lines_skipped": inherited_lines,
-            "segment_index": {"files": seg_index.files, "unreadable_dirs": seg_index.unreadable_dirs},
+            "segment_index": {"files": seg_index.files, "unreadable_dirs": seg_index.unreadable_dirs, "unreadable_entries": seg_index.unreadable_entries},
             "threads_with_several_segments": segmented_threads,
             "segment_files_of_those": segment_files,
             "threads_with_untracked_tokens": untracked_threads,
@@ -1162,5 +1196,20 @@ mod tests {
         assert!(mentions_cwd(r#"{"cwd":"/p/q"}"#, &n));
         assert!(mentions_cwd(r#"{"cwd":"/p/q/r"}"#, &n));
         assert!(!mentions_cwd(r#"{"cwd":"/p/qq"}"#, &n));
+    }
+
+    #[test]
+    fn fork_outcomes() {
+        let parent = vec![5000, 8000];
+        assert_eq!(fork_outcome(Some(&parent), 9000, 8000), "verified");
+        // A replay of the base thread's first counter has a zero base.
+        assert_eq!(fork_outcome(Some(&parent), 5000, 0), "replayed");
+        assert_eq!(fork_outcome(Some(&parent), 8000, 5000), "replayed");
+        // A first snapshot without a request (last = 0) is not a replay.
+        assert_eq!(fork_outcome(Some(&parent), 8000, 8000), "verified");
+        assert_eq!(fork_outcome(Some(&parent), 300, 0), "zero_base");
+        assert_eq!(fork_outcome(None, 300, 0), "zero_base");
+        assert_eq!(fork_outcome(None, 9000, 8000), "parent_unavailable");
+        assert_eq!(fork_outcome(Some(&parent), 9000, 7000), "mismatched");
     }
 }

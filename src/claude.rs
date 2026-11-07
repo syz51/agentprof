@@ -885,6 +885,9 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
             .unwrap_or_else(|| "unknown".into());
         s.by_day.entry(d).or_default().add_request(&rq.tokens, usd);
         let prompt = rq.tokens.prompt();
+        if usd.is_some_and(|c| c.long_context) {
+            tr.long_context.push((prompt, rq.line));
+        }
         s.max_prompt_tokens = Some(s.max_prompt_tokens.unwrap_or(0).max(prompt));
         if let Some(w) = cx.pricing.model(&rq.model).and_then(|m| m.context_window) {
             s.context_window = Some(w);

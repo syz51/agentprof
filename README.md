@@ -70,7 +70,7 @@ The detector thresholds are listed under [Rules](#rules).
 
 A missing input file is reported in `scan.json` under `inputs` and `coverage`. It is not an error. Neither is a damaged transcript:
 
-- A Claude line that is not valid UTF-8 counts as a bad line (`coverage.claude.invalid_utf8_lines`). A transcript that cannot be read is skipped and listed under `coverage.claude.unreadable`.
+- A Claude line that is not valid UTF-8 counts as a bad line (`coverage.claude.invalid_utf8_lines`). A transcript that cannot be read is skipped and counted in `coverage.claude.unreadable_files`. Only those in the project's own directory under `~/.claude/projects` are listed by path, in `coverage.claude.unreadable`; the rest are counted in `unreadable_in_other_project_dirs`, so other projects' names stay out of the output.
 - A Codex rollout segment that fails to open or decompress part-way marks the transcript `damaged`. Its tokens, `by_*` breakdowns, active and wall time become unknown, and a `transcript-damaged` finding is written. The tokens counted before the break are only reported in aggregate, as `coverage.codex.tokens_counted_before_damage_excluded`.
 
 ### `agentprof report`
@@ -84,6 +84,7 @@ Renders a Markdown summary of a scan directory. It covers:
 - Totals by source and time by source.
 - Main sessions vs subagents.
 - Breakdowns by model, effort, day and billing mode.
+- Long-context pricing: per model, the priced requests, how many had prompts over the model's long-context threshold, the surcharge the tier added over standard rates, and the cost of all the model's requests.
 - Top sessions by tokens and by wall time.
 - Tools and Codex operations.
 - Web statuses and failing hosts.
@@ -169,7 +170,7 @@ One JSON object per line. The fields:
 | `cost` | object | `usd` (null if any request is unpriced), `priced_usd`, `unpriced_requests`, `unpriced_models`, `server_tool_usd`, `basis` |
 | `billing` | object | `mode`: `subscription`, `api`, `refused` or `unknown`. Also `basis` and `plan_type`. |
 | `claude_code_cost_usd` | number or null | Claude Code's own cost counter. Reported, never used. |
-| `transcript` | object or null | `path` (Codex: the newest segment), `status` (`present`, `zstd`, `missing`; Codex also `damaged` or `incomplete`, when the recorded newest segment is missing but earlier ones exist), `lines`, `bad_lines`, `inherited_lines`; `segments` (Codex: every segment file read, oldest first, when there are several) and `error` (the read error of a damaged transcript). |
+| `transcript` | object or null | `path` (Codex: the newest segment), `status` (`present`, `zstd`, `missing`; Codex also `damaged` or `incomplete`, when the recorded newest segment is missing but earlier ones exist), `lines`, `bad_lines`, `inherited_lines`; `segments` (Codex: every segment file read, oldest first, when there are several or the recorded newest one is missing) and `error` (the read error of a damaged transcript). |
 | `t3` | object or null | T3 threads only. `project_id`, `provider`, `runs_by_status`, `runs_by_model`, `runs_by_effort`, `runs_by_provider` (the run's own provider, then status), `archived`, `deleted`, `linked` (`<source>:<id>`), `link_basis`, `unresolved_links`. |
 | `notes` | array of string | Caveats specific to this session, such as an assumed service tier. |
 

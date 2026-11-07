@@ -135,6 +135,8 @@ pub struct Trace {
     pub large_outputs: Vec<(String, u64, u64)>,
     /// Requests near the context window: (prompt tokens, window, line).
     pub near_context: Vec<(u64, u64, u64)>,
+    /// Requests priced at the long-context tier: (prompt tokens, line).
+    pub long_context: Vec<(u64, u64)>,
     /// Active turn intervals in Unix milliseconds.
     pub intervals: Vec<(i64, i64)>,
     pub rate_limit_lines: Vec<u64>,
@@ -272,7 +274,7 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
                 top.rereads
             ),
             ev(t, top.first_reread_line.unwrap_or(top.first_line)),
-            json!({"files_over_threshold": rereads.len(), "max_reads": top.reads, "max_repeat_reads": top.rereads, "repeat_reads": extra, "top": files}),
+            json!({"files_over_threshold": rereads.len(), "max_reads": rereads.iter().map(|(_, r)| r.reads).max().unwrap_or(0), "max_repeat_reads": top.rereads, "repeat_reads": extra, "top": files}),
         ));
     }
 
@@ -469,11 +471,12 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
     // long-context-tier
     if let Some(total) = &s.total
         && total.long_context_requests > 0
-        && total.long_context_requests as f64
-            >= th.long_context_share * (total.requests - total.unpriced_requests) as f64
+        // A share exactly at the threshold counts, despite float rounding.
+        && total.long_context_requests as f64 / total.priced_requests() as f64
+            >= th.long_context_share - 1e-9
     {
         let lc = total.long_context_requests;
-        let priced = total.requests - total.unpriced_requests;
+        let priced = total.priced_requests();
         out.push(cx.finding(
             "long-context-tier",
             "warn",
@@ -483,7 +486,11 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
                 100.0 * lc as f64 / priced as f64,
                 total.long_context_usd
             ),
-            Vec::new(),
+            t.long_context
+                .iter()
+                .max_by_key(|x| x.0)
+                .map(|(_, line)| ev(t, *line))
+                .unwrap_or_default(),
             json!({"long_context_requests": lc, "priced_requests": priced, "long_context_usd": total.long_context_usd}),
         ));
     }
@@ -655,16 +662,12 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
 
     // transcript-damaged
     if let Some(tr) = &s.transcript
-        && matches!(tr.status.as_str(), "damaged" | "incomplete" | "unreadable")
+        && matches!(tr.status.as_str(), "damaged" | "incomplete")
     {
-        let message = match tr.status.as_str() {
-            "incomplete" => {
-                "earlier rollout segments exist but the newest one the database records is missing; the thread's tokens are unknown"
-            }
-            "damaged" => {
-                "a rollout segment could not be read to the end; the thread's tokens are unknown"
-            }
-            _ => "the transcript could not be read; it was skipped",
+        let message = if tr.status == "incomplete" {
+            "earlier rollout segments exist but the newest one the database records is missing; the thread's tokens are unknown"
+        } else {
+            "a rollout segment could not be read to the end; the thread's tokens are unknown"
         };
         out.push(cx.finding(
             "transcript-damaged",
