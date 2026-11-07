@@ -1839,7 +1839,7 @@ mod tests {
         ]);
         let p = run(&th, &b);
         let t = p.session.total.as_ref().unwrap();
-        assert_eq!(t.long_context_requests, 0);
+        assert_eq!(t.long_context_requests, Some(0));
         assert_eq!(p.check.multi_request_increments, 1);
         assert_eq!(p.check.multi_request_tier_differs, 1);
         let usd = p.session.cost.usd.unwrap();

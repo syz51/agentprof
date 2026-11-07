@@ -52,7 +52,7 @@ impl Tokens {
 }
 
 /// Tokens and API-equivalent cost accumulated over model requests.
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Acc {
     /// Model responses counted (Claude: deduplicated API requests; Codex:
     /// token-counter increments).
@@ -65,11 +65,25 @@ pub struct Acc {
     pub unpriced_requests: u64,
     /// Priced requests whose prompt was over the model's long-context
     /// threshold, and what that tier added over the standard rates (USD,
-    /// included in `priced_usd`).
-    #[serde(default)]
-    pub long_context_requests: u64,
-    #[serde(default)]
-    pub long_context_usd: f64,
+    /// included in `priced_usd`). `None` when read from a scan written
+    /// before agentprof recorded them: unknown, not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_context_requests: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_context_usd: Option<f64>,
+}
+
+impl Default for Acc {
+    fn default() -> Self {
+        Acc {
+            requests: 0,
+            tokens: Tokens::default(),
+            priced_usd: 0.0,
+            unpriced_requests: 0,
+            long_context_requests: Some(0),
+            long_context_usd: Some(0.0),
+        }
+    }
 }
 
 impl Acc {
@@ -80,8 +94,12 @@ impl Acc {
             Some(c) => {
                 self.priced_usd += c.usd;
                 if c.long_context {
-                    self.long_context_requests += 1;
-                    self.long_context_usd += c.long_context_usd;
+                    if let Some(n) = &mut self.long_context_requests {
+                        *n += 1;
+                    }
+                    if let Some(u) = &mut self.long_context_usd {
+                        *u += c.long_context_usd;
+                    }
                 }
             }
             None => self.unpriced_requests += 1,
@@ -97,8 +115,15 @@ impl Acc {
         self.tokens.add(&o.tokens);
         self.priced_usd += o.priced_usd;
         self.unpriced_requests += o.unpriced_requests;
-        self.long_context_requests += o.long_context_requests;
-        self.long_context_usd += o.long_context_usd;
+        // Unknown on either side stays unknown.
+        self.long_context_requests = self
+            .long_context_requests
+            .zip(o.long_context_requests)
+            .map(|(a, b)| a + b);
+        self.long_context_usd = self
+            .long_context_usd
+            .zip(o.long_context_usd)
+            .map(|(a, b)| a + b);
     }
 
     /// Full cost when every request was priced, otherwise unknown.
@@ -419,7 +444,27 @@ mod tests {
         a.add_request(&t, Some(long));
         let mut b = Acc::default();
         b.merge(&a);
-        assert_eq!((b.long_context_requests, b.long_context_usd), (1, 0.5));
+        assert_eq!(
+            (b.long_context_requests, b.long_context_usd),
+            (Some(1), Some(0.5))
+        );
         assert_eq!(b.priced_usd, 3.0);
+        assert!(
+            !serde_json::to_string(&Acc::default())
+                .unwrap()
+                .contains("null")
+        );
+        // A scan written before these fields existed reads them as unknown,
+        // and merging keeps them unknown.
+        let mut old: serde_json::Value = serde_json::to_value(&b).unwrap();
+        old.as_object_mut().unwrap().remove("long_context_requests");
+        old.as_object_mut().unwrap().remove("long_context_usd");
+        let old: Acc = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            (old.long_context_requests, old.long_context_usd),
+            (None, None)
+        );
+        b.merge(&old);
+        assert_eq!((b.long_context_requests, b.long_context_usd), (None, None));
     }
 }

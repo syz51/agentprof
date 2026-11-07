@@ -470,12 +470,11 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
 
     // long-context-tier
     if let Some(total) = &s.total
-        && total.long_context_requests > 0
+        && let (Some(lc), Some(lc_usd)) = (total.long_context_requests, total.long_context_usd)
+        && lc > 0
         // A share exactly at the threshold counts, despite float rounding.
-        && total.long_context_requests as f64 / total.priced_requests() as f64
-            >= th.long_context_share - 1e-9
+        && lc as f64 / total.priced_requests() as f64 >= th.long_context_share - 1e-9
     {
-        let lc = total.long_context_requests;
         let priced = total.priced_requests();
         out.push(cx.finding(
             "long-context-tier",
@@ -484,14 +483,14 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
             format!(
                 "{lc} of {priced} priced request(s) ({:.1}%) had prompts over the long-context threshold; the tier added ${:.2} over standard rates",
                 100.0 * lc as f64 / priced as f64,
-                total.long_context_usd
+                lc_usd
             ),
             t.long_context
                 .iter()
                 .max_by_key(|x| x.0)
                 .map(|(_, line)| ev(t, *line))
                 .unwrap_or_default(),
-            json!({"long_context_requests": lc, "priced_requests": priced, "long_context_usd": total.long_context_usd}),
+            json!({"long_context_requests": lc, "priced_requests": priced, "long_context_usd": lc_usd}),
         ));
     }
 

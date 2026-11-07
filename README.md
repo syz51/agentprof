@@ -174,7 +174,7 @@ One JSON object per line. The fields:
 | `t3` | object or null | T3 threads only. `project_id`, `provider`, `runs_by_status`, `runs_by_model`, `runs_by_effort`, `runs_by_provider` (the run's own provider, then status), `archived`, `deleted`, `linked` (`<source>:<id>`), `link_basis`, `unresolved_links`. |
 | `notes` | array of string | Caveats specific to this session, such as an assumed service tier. |
 
-An **Acc** is `{requests, tokens, priced_usd, unpriced_requests, long_context_requests, long_context_usd}`. The last two count the priced requests whose prompt exceeded the model's long-context threshold, and what that tier added over the standard rates (already included in `priced_usd`).
+An **Acc** is `{requests, tokens, priced_usd, unpriced_requests, long_context_requests, long_context_usd}`. The last two count the priced requests whose prompt exceeded the model's long-context threshold, and what that tier added over the standard rates (already included in `priced_usd`). A scan written before they existed lacks them; `report` then says long-context use was not recorded instead of showing zero, and `long-context-tier` does not fire.
 
 **Tokens** has seven fields:
 

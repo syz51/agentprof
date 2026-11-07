@@ -465,6 +465,36 @@ fn scan_and_report_end_to_end() {
         }
     }
     assert!(!md.contains(SECRET_OUTPUT) && !md.contains(SECRET_TITLE));
+
+    // A scan written before agentprof counted long-context requests has no
+    // such fields: the report says they were not recorded, not that there
+    // were none.
+    fn strip(v: &mut Value) {
+        match v {
+            Value::Object(m) => {
+                m.remove("long_context_requests");
+                m.remove("long_context_usd");
+                m.values_mut().for_each(strip);
+            }
+            Value::Array(a) => a.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let path = out.join("sessions.jsonl");
+    let mut old = String::new();
+    for mut row in read_jsonl(&path) {
+        strip(&mut row);
+        old.push_str(&serde_json::to_string(&row).unwrap());
+        old.push('\n');
+    }
+    assert!(!old.contains("long_context_"));
+    std::fs::write(&path, old).unwrap();
+    let rep = Command::new(bin).arg("report").arg(&out).output().unwrap();
+    assert_eq!(rep.status.code(), Some(0));
+    let md = String::from_utf8(rep.stdout).unwrap();
+    let lc = &md[md.find("## Long-context pricing").unwrap()..md.find("## Billing mode").unwrap()];
+    assert!(lc.contains("Not recorded"), "{lc}");
+    assert!(!lc.contains("| none |") && !lc.contains("| 0 |"), "{lc}");
 }
 
 #[test]

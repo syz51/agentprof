@@ -331,38 +331,55 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
         o,
         "Requests whose prompt exceeded the model's long-context threshold in `pricing.toml` are priced at that tier. The surcharge is the tier's cost minus the same tokens at standard rates; it is included in every cost above.\n"
     );
-    let _ = writeln!(
-        o,
-        "| Source / model | Priced requests | Over the threshold | Share | Surcharge | Cost of all requests |\n|---|---:|---:|---:|---:|---:|"
-    );
-    for ((src, model), a) in by_model.iter().filter(|(_, a)| a.long_context_requests > 0) {
-        let priced = a.priced_requests();
+    let unrecorded = by_model
+        .values()
+        .any(|a| a.long_context_requests.is_none() || a.long_context_usd.is_none());
+    if unrecorded {
         let _ = writeln!(
             o,
-            "| {src} / {model} | {} | {} | {} | ${:.2} | {} |",
-            num(priced),
-            num(a.long_context_requests),
-            pct(a.long_context_requests, priced),
-            a.long_context_usd,
-            usd(a)
+            "Not recorded: the agentprof that wrote this scan did not count long-context requests. Rerun `agentprof scan` to see them.\n"
         );
-        lc_total.merge(a);
-    }
-    if lc_total.long_context_requests == 0 {
-        let _ = writeln!(o, "| none | – | 0 | – | $0.00 | – |");
     } else {
-        let priced = lc_total.priced_requests();
         let _ = writeln!(
             o,
-            "| **all models above** | {} | {} | {} | ${:.2} | {} |",
-            num(priced),
-            num(lc_total.long_context_requests),
-            pct(lc_total.long_context_requests, priced),
-            lc_total.long_context_usd,
-            usd(&lc_total)
+            "| Source / model | Priced requests | Over the threshold | Share | Surcharge | Cost of all requests |\n|---|---:|---:|---:|---:|---:|"
         );
+        for ((src, model), a) in &by_model {
+            let (Some(lc), Some(lc_usd)) = (a.long_context_requests, a.long_context_usd) else {
+                continue;
+            };
+            if lc == 0 {
+                continue;
+            }
+            let priced = a.priced_requests();
+            let _ = writeln!(
+                o,
+                "| {src} / {model} | {} | {} | {} | ${lc_usd:.2} | {} |",
+                num(priced),
+                num(lc),
+                pct(lc, priced),
+                usd(a)
+            );
+            lc_total.merge(a);
+        }
+        match (lc_total.long_context_requests, lc_total.long_context_usd) {
+            (Some(lc), Some(lc_usd)) if lc > 0 => {
+                let priced = lc_total.priced_requests();
+                let _ = writeln!(
+                    o,
+                    "| **all models above** | {} | {} | {} | ${lc_usd:.2} | {} |",
+                    num(priced),
+                    num(lc),
+                    pct(lc, priced),
+                    usd(&lc_total)
+                );
+            }
+            _ => {
+                let _ = writeln!(o, "| none | – | 0 | – | $0.00 | – |");
+            }
+        }
+        let _ = writeln!(o);
     }
-    let _ = writeln!(o);
 
     // ---- Billing mode.
     let _ = writeln!(o, "## Billing mode\n");
