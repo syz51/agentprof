@@ -415,7 +415,23 @@ fn read_range(input: Option<&Value>) -> String {
 /// The file and range a Bash command reads, keyed like a `Read` of the same
 /// lines: one simple `cat`, `nl` or `sed -n` command (see
 /// `util::read_command`) with one file operand, resolved against `cwd`.
+/// The command may follow exactly one `cd DIR &&`, with DIR literal and
+/// resolved against `cwd`; the file is then resolved against DIR.
 fn shell_read(cmd: &str, cwd: Option<&str>) -> Option<(String, String)> {
+    let (dir, cmd) = match cmd.split_once("&&") {
+        Some((cd, read)) => {
+            let cd = crate::util::simple_command_words(cd)?;
+            let [prog, dir] = cd.as_slice() else {
+                return None;
+            };
+            if prog != "cd" || dir.starts_with('-') {
+                return None;
+            }
+            (Some(crate::util::resolve_path(cwd, dir)?), read)
+        }
+        None => (cwd.map(str::to_string), cmd),
+    };
+    let cwd = dir.as_deref();
     let words = crate::util::simple_command_words(cmd)?;
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
     let (range, files) = crate::util::read_command(&words)?;
@@ -1176,7 +1192,23 @@ this line is not json
         // not reads.
         for c in [
             "cat a.md | head",
-            "cd x && cat a.md",
+            "cd x && cat a.md && ls",
+            "cd x && cd y && cat a.md",
+            "cd x && cat a.md | head",
+            "cd x; cat a.md",
+            "cd x || cat a.md",
+            "cd x & cat a.md",
+            "cd && cat a.md",
+            "cd -P x && cat a.md",
+            "cd - && cat a.md",
+            "cd x y && cat a.md",
+            "cd $D && cat a.md",
+            "cd ~/x && cat a.md",
+            "cd 'x && cat a.md",
+            "pushd x && cat a.md",
+            "&& cat a.md",
+            "cd x && ",
+            "cd x && head a.md",
             "cat a.md || true",
             "cat a.md; ls",
             "cat a.md > b.md",
@@ -1197,6 +1229,22 @@ this line is not json
         ] {
             assert_eq!(read(c), None, "{c}");
         }
+        // One literal `cd DIR &&` prefix moves the base of the file path.
+        let sub = Some(("/work/proj/sub/a.rs".to_string(), "lines 1-5".to_string()));
+        assert_eq!(read("cd sub && sed -n '1,5p' a.rs"), sub);
+        assert_eq!(read("cd 'sub'&&sed -n 1,5p ./a.rs"), sub);
+        assert_eq!(read("cd /work && sed -n '1,5p' proj/sub/a.rs"), sub);
+        assert_eq!(read("cd sub/.. && sed -n '1,5p' sub/a.rs"), sub);
+        assert_eq!(read("cd x && sed -n '1,5p' /work/proj/sub/a.rs"), sub);
+        assert_eq!(
+            read("cd /abs && cat a.md"),
+            Some(("/abs/a.md".to_string(), "whole".to_string()))
+        );
+        assert_eq!(
+            shell_read("cd /abs && nl -ba a.md", None),
+            Some(("/abs/a.md".to_string(), "whole".to_string()))
+        );
+        assert_eq!(shell_read("cd sub && cat a.md", None), None);
         assert_eq!(shell_read("cat a.md", None), None);
         assert_eq!(
             shell_read("cat /abs/a.md", None),
