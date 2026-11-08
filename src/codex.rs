@@ -28,7 +28,7 @@ use serde_json::value::RawValue;
 
 use crate::detect::Trace;
 use crate::pricing::Pricing;
-use crate::session::{Acc, OpStat, Session, Spawn, Tokens, Transcript};
+use crate::session::{Acc, OpStat, Reads, Session, Spawn, Tokens, Transcript};
 use crate::util::{day, display_path, host_of, parse_ts, tilde};
 
 /// Opens a SQLite file read-only. `mode=ro` needs to create the `-shm` file
@@ -409,6 +409,8 @@ struct Item {
     exit_code: Option<i64>,
     command: Option<Value>,
     parsed_cmd: Option<Vec<ParsedCmd>>,
+    /// Command output; Codex keeps at most 64 KiB of it in the rollout.
+    aggregated_output: Option<String>,
     duration: Option<Duration>,
     server: Option<String>,
     result: Option<Value>,
@@ -623,6 +625,7 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
         };
     }
 
+    s.reads = Some(Reads::default());
     let mut total = Acc::default();
     let mut prev: Option<Usage> = None;
     let mut model = th.model.clone();
@@ -1251,12 +1254,21 @@ fn item(s: &mut Session, tr: &mut Trace, it: Item, ln: u64) {
         if let Some(cmd) = it.command.as_ref().and_then(command_text) {
             tr.command(&cmd, ln);
         }
+        let mut read = false;
         for pc in it.parsed_cmd.iter().flatten() {
             if pc.kind.as_deref() == Some("read")
                 && let Some(p) = &pc.path
             {
                 tr.read(p, &read_range(pc.cmd.as_deref()), ln);
+                read = true;
             }
+        }
+        if read && let Some(r) = &mut s.reads {
+            r.calls += 1;
+            r.result_chars += it
+                .aggregated_output
+                .as_deref()
+                .map_or(0, |o| o.chars().count() as u64);
         }
     }
     if kind == "Extension"
@@ -1461,7 +1473,7 @@ mod tests {
         let b = rollout(&[
             r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","ordinal":1,"payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"x"}}"#.into(),
             r#"{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","ordinal":2,"payload":{"type":"item_completed","item":{"type":"CommandExecution","status":"failed","exit_code":1,"command":["/bin/zsh","-lc","sleep 5"],"parsed_cmd":[{"type":"unknown","cmd":"sleep 5"}],"duration":{"secs":5,"nanos":0}}}}"#.into(),
-            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","ordinal":3,"payload":{"type":"item_completed","item":{"type":"CommandExecution","status":"completed","exit_code":0,"command":["/bin/zsh","-lc","cat a.md"],"parsed_cmd":[{"type":"read","path":"a.md","name":"a.md","cmd":"cat a.md"}],"duration":{"secs":0,"nanos":2000000}}}}"#.into(),
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","ordinal":3,"payload":{"type":"item_completed","item":{"type":"CommandExecution","status":"completed","exit_code":0,"command":["/bin/zsh","-lc","cat a.md"],"parsed_cmd":[{"type":"read","path":"a.md","name":"a.md","cmd":"cat a.md"}],"aggregated_output":"héllo","duration":{"secs":0,"nanos":2000000}}}}"#.into(),
             r#"{"timestamp":"2026-01-01T00:00:04Z","type":"response_item","ordinal":4,"payload":{"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"Script failed: boom"}]}}"#.into(),
             r#"{"timestamp":"2026-01-01T00:00:05Z","type":"event_msg","ordinal":5,"payload":{"type":"item_completed","item":{"type":"Extension","action":{"type":"openPage","url":"https://Example.org/x"}}}}"#.into(),
             r#"{"timestamp":"2026-01-01T00:00:06Z","type":"event_msg","ordinal":6,"payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":100.0},"secondary":null,"plan_type":"plus","rate_limit_reached_type":"workspace_member_usage_limit_reached"}}}"#.into(),
@@ -1477,6 +1489,14 @@ mod tests {
         assert_eq!((cmd.count, cmd.failed, cmd.duration_ms_total), (2, 1, 5002));
         assert_eq!(p.trace.sleeps, 1);
         assert_eq!(p.trace.reads["a.md"].reads, 1);
+        // The parsed read counts with its output in characters; `sleep` does not.
+        assert_eq!(
+            p.session.reads,
+            Some(Reads {
+                calls: 1,
+                result_chars: 5,
+            })
+        );
         assert_eq!(p.session.web["example.org"]["no-status"], 1);
         let rl = &p.session.rate_limits;
         assert_eq!(
@@ -1521,6 +1541,7 @@ mod tests {
         assert_eq!(s.transcript.as_ref().unwrap().status, "missing");
         assert!(s.total.is_none());
         assert_eq!(s.db_tokens_used, Some(77));
+        assert_eq!(s.reads, None);
         assert_eq!(s.cost.usd, None);
         assert_eq!(s.wall_ms, Some(1000));
     }

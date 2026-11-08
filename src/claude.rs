@@ -16,7 +16,7 @@ use serde_json::value::RawValue;
 
 use crate::detect::Trace;
 use crate::pricing::{Pricing, RequestCost};
-use crate::session::{Acc, Session, Spawn, Tokens, ToolStat, Transcript};
+use crate::session::{Acc, Reads, Session, Spawn, Tokens, ToolStat, Transcript};
 use crate::util::{day, display_path, host_of, parse_ts, tilde};
 
 #[derive(Debug, Clone)]
@@ -275,6 +275,8 @@ struct Pending {
     name: String,
     ts: Option<i64>,
     url: Option<String>,
+    /// A `Read` call or a shell read (see `shell_read`).
+    read: bool,
 }
 
 /// Totals for the cross-check: naive per-line sums versus deduplicated sums.
@@ -504,6 +506,7 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
         Kind::Subagent { parent, .. } => (format!("{parent}/{}", c.stem), Some(parent.clone())),
     };
     let mut s = Session::new("claude", &id);
+    let mut reads = Reads::default();
     let mut tr = Trace {
         evidence: display_path(&c.path),
         ..Trace::default()
@@ -687,22 +690,29 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
                         s.tools.entry(name.clone()).or_default().calls += 1;
                         let input = b.input.as_ref();
                         let field = |k: &str| input.and_then(|v| v.get(k)).and_then(|v| v.as_str());
-                        match name.as_str() {
+                        let read = match name.as_str() {
                             "Read" => {
                                 if let Some(p) = field("file_path") {
                                     tr.read(p, &read_range(input), ln);
                                 }
+                                true
                             }
-                            "Bash" => {
-                                if let Some(cmd) = field("command") {
+                            "Bash" => match field("command") {
+                                Some(cmd) => {
                                     tr.command(cmd, ln);
                                     let cwd = r.cwd.as_deref().or(first_cwd.as_deref());
-                                    if let Some((p, range)) = shell_read(cmd, cwd) {
-                                        tr.read(&p, &range, ln);
+                                    let read = shell_read(cmd, cwd);
+                                    if let Some((p, range)) = &read {
+                                        tr.read(p, range, ln);
                                     }
+                                    read.is_some()
                                 }
-                            }
-                            _ => {}
+                                None => false,
+                            },
+                            _ => false,
+                        };
+                        if read {
+                            reads.calls += 1;
                         }
                         if is_poll_tool(&name) {
                             *tr.polls.entry(name.clone()).or_default() += 1;
@@ -713,6 +723,7 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
                                 name,
                                 ts,
                                 url: field("url").map(str::to_string),
+                                read,
                             },
                         );
                     }
@@ -783,6 +794,9 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
                         }
                         stat.result_chars_total += chars;
                         stat.result_chars_max = stat.result_chars_max.max(chars);
+                        if p.read {
+                            reads.result_chars += chars;
+                        }
                         tr.outcomes.push((is_err, ln));
                         if chars >= cx.large_output_chars {
                             tr.large_outputs.push((p.name.clone(), chars, ln));
@@ -843,6 +857,7 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
         timed += 1;
         tr.intervals.push((st, lt.max(st)));
     }
+    s.reads = Some(reads);
     s.open_turns = pending.len() as u64;
     if !pending.is_empty() {
         s.notes
@@ -1308,6 +1323,53 @@ this line is not json
         let f = crate::detect::per_session(&parsed[0].session, &parsed[0].trace, &dcx);
         let rr = f.iter().find(|f| f.rule == "file-reread").unwrap();
         assert_eq!(rr.data["max_reads"], 5);
+    }
+
+    #[test]
+    fn reads_sum_read_and_shell_read_results() {
+        let mut lines = vec![
+            r#"{"type":"user","uuid":"u0","sessionId":"s6","cwd":"/work/proj","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"go"}}"#.to_string(),
+        ];
+        let calls = [
+            (
+                "Read",
+                r#"{"file_path":"/work/proj/a.md"}"#.to_string(),
+                "0123456789",
+            ),
+            (
+                "Bash",
+                r#"{"command":"sed -n '1,2p' b.md"}"#.into(),
+                "abcdefg",
+            ),
+            ("Bash", r#"{"command":"cd sub && cat c.md"}"#.into(), "xyz"),
+            // Not a read: its result is left out.
+            ("Bash", r#"{"command":"ls"}"#.into(), "many files here"),
+        ];
+        for (n, (name, input, result)) in calls.iter().enumerate() {
+            let n = n + 1;
+            lines.push(format!(
+                r#"{{"type":"assistant","uuid":"a{n}","requestId":"r{n}","sessionId":"s6","cwd":"/work/proj","timestamp":"2026-01-01T00:00:{n:02}Z","message":{{"id":"m{n}","model":"claude-opus-5-5","content":[{{"type":"tool_use","id":"tu{n}","name":"{name}","input":{input}}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
+            ));
+            lines.push(format!(
+                r#"{{"type":"user","uuid":"t{n}","sessionId":"s6","cwd":"/work/proj","timestamp":"2026-01-01T00:00:{n:02}Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"tu{n}","content":"{result}"}}]}}}}"#
+            ));
+        }
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("-work-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("s6.jsonl"), lines.join("\n") + "\n").unwrap();
+        let (parsed, _) = parse_all(d.path());
+        let s = &parsed[0].session;
+        assert_eq!(s.tools["Read"].result_chars_total, 10);
+        assert_eq!(
+            s.reads,
+            Some(Reads {
+                calls: 3,
+                result_chars: 10 + 7 + 3,
+            })
+        );
+        let v = serde_json::to_value(s).unwrap();
+        assert_eq!(v["reads"]["result_chars"], 20);
     }
 
     #[test]
