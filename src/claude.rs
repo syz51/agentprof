@@ -378,7 +378,9 @@ fn is_challenge_page(text: &str) -> bool {
 }
 
 /// The range a `Read` call covers, as a file-reread key: `whole` without
-/// offset, limit or pages, otherwise those values.
+/// offset, limit or pages; `lines a-b` for a numeric limit and optional
+/// numeric offset (the first line, 1-based), as a shell `sed -n 'a,bp'`
+/// read keys; otherwise those values.
 fn read_range(input: Option<&Value>) -> String {
     let get = |k: &str| {
         input
@@ -390,7 +392,16 @@ fn read_range(input: Option<&Value>) -> String {
                     .unwrap_or_else(|| v.to_string())
             })
     };
-    match (get("offset"), get("limit"), get("pages")) {
+    let (offset, limit, pages) = (get("offset"), get("limit"), get("pages"));
+    let num = |s: &Option<String>| s.as_deref().and_then(|s| s.parse::<u64>().ok());
+    if pages.is_none()
+        && let Some(n) = num(&limit).filter(|&n| n > 0)
+        && (offset.is_none() || num(&offset).is_some())
+    {
+        let a = num(&offset).unwrap_or(1).max(1);
+        return format!("lines {a}-{}", a.saturating_add(n - 1));
+    }
+    match (offset, limit, pages) {
         (None, None, None) => "whole".into(),
         (o, l, p) => format!(
             "offset {} limit {} pages {}",
@@ -399,6 +410,19 @@ fn read_range(input: Option<&Value>) -> String {
             p.unwrap_or_default()
         ),
     }
+}
+
+/// The file and range a Bash command reads, keyed like a `Read` of the same
+/// lines: one simple `cat`, `nl` or `sed -n` command (see
+/// `util::read_command`) with one file operand, resolved against `cwd`.
+fn shell_read(cmd: &str, cwd: Option<&str>) -> Option<(String, String)> {
+    let words = crate::util::simple_command_words(cmd)?;
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let (range, files) = crate::util::read_command(&words)?;
+    let [file] = files.as_slice() else {
+        return None;
+    };
+    Some((crate::util::resolve_path(cwd, file)?, range))
 }
 
 fn is_poll_tool(name: &str) -> bool {
@@ -656,6 +680,10 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
                             "Bash" => {
                                 if let Some(cmd) = field("command") {
                                     tr.command(cmd, ln);
+                                    let cwd = r.cwd.as_deref().or(first_cwd.as_deref());
+                                    if let Some((p, range)) = shell_read(cmd, cwd) {
+                                        tr.read(&p, &range, ln);
+                                    }
                                 }
                             }
                             _ => {}
@@ -1108,12 +1136,130 @@ this line is not json
         assert_eq!(read_range(Some(&v(r#"{"file_path":"/a"}"#))), "whole");
         assert_eq!(
             read_range(Some(&v(r#"{"file_path":"/a","offset":100,"limit":50}"#))),
-            "offset 100 limit 50 pages "
+            "lines 100-149"
+        );
+        assert_eq!(
+            read_range(Some(&v(r#"{"file_path":"/a","limit":5}"#))),
+            "lines 1-5"
+        );
+        assert_eq!(
+            read_range(Some(&v(r#"{"file_path":"/a","offset":0,"limit":5}"#))),
+            "lines 1-5"
+        );
+        assert_eq!(
+            read_range(Some(&v(r#"{"file_path":"/a","offset":100}"#))),
+            "offset 100 limit  pages "
+        );
+        assert_eq!(
+            read_range(Some(&v(r#"{"file_path":"/a.pdf","pages":"1-3"}"#))),
+            "offset  limit  pages 1-3"
         );
         assert_ne!(
             read_range(Some(&v(r#"{"file_path":"/a","offset":1}"#))),
             read_range(Some(&v(r#"{"file_path":"/a","offset":2}"#)))
         );
+    }
+
+    #[test]
+    fn shell_reads_key_like_read_calls() {
+        let cwd = Some("/work/proj");
+        let read = |c: &str| shell_read(c, cwd);
+        let lines = Some(("/work/proj/src/a.rs".to_string(), "lines 10-20".to_string()));
+        assert_eq!(read("sed -n '10,20p' src/a.rs"), lines);
+        assert_eq!(read("sed -n \"10,20p\" ./src/../src/a.rs"), lines);
+        assert_eq!(read("sed -n 10,20p /work/proj/src/a.rs"), lines);
+        let whole = Some(("/work/proj/a b.md".to_string(), "whole".to_string()));
+        assert_eq!(read("cat 'a b.md'"), whole);
+        assert_eq!(read("nl -ba \"a b.md\""), whole);
+        assert_eq!(read("nl 'a b.md'"), whole);
+        // Compound commands, redirects, expansions and other programs are
+        // not reads.
+        for c in [
+            "cat a.md | head",
+            "cd x && cat a.md",
+            "cat a.md || true",
+            "cat a.md; ls",
+            "cat a.md > b.md",
+            "cat < a.md",
+            "cat a.md 2>&1",
+            "sed -n '1,5p' a.md &",
+            "cat $F",
+            "cat ~/a.md",
+            "cat *.md",
+            "cat a.md b.md",
+            "cat",
+            "cat -n a.md",
+            "nl -w2 a.md",
+            "sed -n '1,$p' a.md",
+            "sed -i '1,5p' a.md",
+            "head -n 5 a.md",
+            "cat 'a.md",
+        ] {
+            assert_eq!(read(c), None, "{c}");
+        }
+        assert_eq!(shell_read("cat a.md", None), None);
+        assert_eq!(
+            shell_read("cat /abs/a.md", None),
+            Some(("/abs/a.md".to_string(), "whole".to_string()))
+        );
+    }
+
+    #[test]
+    fn bash_rereads_of_one_range_raise_file_reread() {
+        let line = |n: usize, block: &str| {
+            format!(
+                r#"{{"type":"assistant","uuid":"a{n}","requestId":"r{n}","sessionId":"s5","cwd":"/work/proj","timestamp":"2026-01-01T00:00:{n:02}Z","message":{{"id":"m{n}","model":"claude-opus-5-5","content":[{block}],"usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
+            )
+        };
+        let bash = |n: usize, cmd: &str| {
+            line(
+                n,
+                &format!(
+                    r#"{{"type":"tool_use","id":"tu{n}","name":"Bash","input":{{"command":{}}}}}"#,
+                    serde_json::to_string(cmd).unwrap()
+                ),
+            )
+        };
+        let mut lines = vec![
+            r#"{"type":"user","uuid":"u0","sessionId":"s5","cwd":"/work/proj","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"go"}}"#.to_string(),
+        ];
+        for n in 1..=5 {
+            lines.push(bash(n, "sed -n '10,20p' src/a.rs"));
+        }
+        // Compound commands of the same file are not reads.
+        lines.push(bash(6, "sed -n '10,20p' src/a.rs | head"));
+        lines.push(bash(7, "cat src/b.rs && cat src/b.rs"));
+        lines.push(line(
+            8,
+            r#"{"type":"tool_use","id":"tu8","name":"Read","input":{"file_path":"/work/proj/src/a.rs","offset":10,"limit":11}}"#,
+        ));
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("-work-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("s5.jsonl"), lines.join("\n") + "\n").unwrap();
+        let (parsed, _) = parse_all(d.path());
+        let p = &parsed[0];
+        assert_eq!(p.trace.reads.len(), 1);
+        let a = &p.trace.reads["/work/proj/src/a.rs"];
+        // Five shell reads and one Read of the same lines.
+        assert_eq!((a.reads, a.rereads), (6, 5));
+        assert_eq!(a.ranges["lines 10-20"], 6);
+        let th = crate::detect::Thresholds::default();
+        let dcx = crate::detect::Ctx {
+            th: &th,
+            at: "2026-01-01T00:00:00Z",
+        };
+        let f = crate::detect::per_session(&p.session, &p.trace, &dcx);
+        let rr = f.iter().find(|f| f.rule == "file-reread").unwrap();
+        assert_eq!(rr.data["max_reads"], 6);
+        assert_eq!(rr.data["max_repeat_reads"], 5);
+
+        // Five shell reads alone reach the default threshold.
+        std::fs::write(proj.join("s5.jsonl"), lines[..6].join("\n") + "\n").unwrap();
+        let (parsed, _) = parse_all(d.path());
+        let f = crate::detect::per_session(&parsed[0].session, &parsed[0].trace, &dcx);
+        let rr = f.iter().find(|f| f.rule == "file-reread").unwrap();
+        assert_eq!(rr.data["max_reads"], 5);
     }
 
     #[test]

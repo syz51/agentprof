@@ -211,6 +211,96 @@ pub fn program_name(cmd: &str) -> String {
     }
 }
 
+/// The words of `cmd` with quotes removed, when it is one simple command
+/// whose words are literal: `None` for a pipe, list (`&&`, `||`, `;`, `&`),
+/// redirect, subshell, expansion (`$`, backquote, glob, `~`), comment,
+/// backslash, newline or unclosed quote.
+pub fn simple_command_words(cmd: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let (mut single, mut double) = (false, false);
+    for c in cmd.chars() {
+        match c {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            _ if single => cur.push(c),
+            '$' | '`' | '\\' | '\n' => return None,
+            _ if double => cur.push(c),
+            '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{' | '}' | '*' | '?' | '[' | '#' | '~' => {
+                return None;
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+                continue;
+            }
+            c => cur.push(c),
+        }
+        in_word = true;
+    }
+    if single || double {
+        return None;
+    }
+    if in_word {
+        words.push(cur);
+    }
+    Some(words)
+}
+
+/// A command that reads files, as its file-reread range key and its file
+/// operands: `whole` for `cat FILE…` (no options) and `nl [-ba] FILE…`,
+/// `lines a-b` for `sed -n 'a,bp' FILE…` (or `'ap'`). `None` for any other
+/// command. Quotes around the `sed` script are ignored.
+pub fn read_command<'a>(words: &[&'a str]) -> Option<(String, Vec<&'a str>)> {
+    let (&prog, args) = words.split_first()?;
+    match prog {
+        "cat" if args.iter().all(|w| !w.starts_with('-')) => Some(("whole".into(), args.to_vec())),
+        "nl" if args.iter().all(|w| !w.starts_with('-') || *w == "-ba") => Some((
+            "whole".into(),
+            args.iter().copied().filter(|w| *w != "-ba").collect(),
+        )),
+        "sed" if args.first() == Some(&"-n") => {
+            let script = args.get(1)?.trim_matches(|c| c == '\'' || c == '"');
+            let body = script.strip_suffix('p')?;
+            let (a, b) = body.split_once(',').unwrap_or((body, body));
+            let number = |s: &str| {
+                s.bytes()
+                    .all(|c| c.is_ascii_digit())
+                    .then(|| s.parse::<u64>().ok())
+                    .flatten()
+            };
+            let (a, b) = (number(a)?, number(b)?);
+            Some((format!("lines {a}-{b}"), args[2..].to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// `path` resolved against the directory `cwd` (both plain strings), with
+/// `.` and `..` removed lexically. `None` for a relative path without an
+/// absolute `cwd`.
+pub fn resolve_path(cwd: Option<&str>, path: &str) -> Option<String> {
+    use std::path::{Component, PathBuf};
+    let joined = match Path::new(path).is_absolute() {
+        true => PathBuf::from(path),
+        false => Path::new(cwd.filter(|c| c.starts_with('/'))?).join(path),
+    };
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out.to_string_lossy().into_owned())
+}
+
 /// True when a shell command sleeps or waits for something to change.
 pub fn is_sleep_command(cmd: &str) -> bool {
     cmd.split(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|' || c == '(')
