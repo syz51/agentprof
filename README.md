@@ -248,7 +248,7 @@ T3 threads carry no tokens, so linking never adds tokens. `coverage.t3` reports 
 | `low-cache-read-ratio` | warn | Cache reads / prompt tokens is below R, in a session with at least M prompt tokens. | `--cache-read-min-ratio` (0.5), `--cache-min-prompt-tokens` (1000000) |
 | `cache-churn` | warn | Cache writes / (writes + reads) is at least R, in a session with at least M prompt tokens. | `--cache-churn-ratio` (0.25) |
 | `frequent-compaction` | warn | At least N compactions. | `--compactions-min` (3) |
-| `near-context-window` | warn | A request's prompt is at least R × the context window. | `--context-ratio` (0.9) |
+| `near-context-window` | warn | A request's prompt is at least R × the context window. It cannot fire for models with a 1,000,000-token window, such as Claude Opus 5.5: Claude Code compacts the context long before the prompt reaches 0.9 × 1M. Claude transcripts record each compaction's `preTokens`, but not the threshold that triggered it. For context pressure in those sessions, use `frequent-compaction` or the session field `max_prompt_tokens` (`rule: session.max_prompt_tokens` in lab). | `--context-ratio` (0.9) |
 | `long-context-tier` | warn | At least a share S of a session's priced requests had prompts over the model's long-context threshold (for example 272k tokens for gpt-6.1-sol), so they were priced at the higher tier. Reports the surcharge. | `--long-context-share` (0.1) |
 | `long-idle-gap` | info | No record for at least N minutes inside a session. | `--idle-gap-minutes` (30) |
 | `rate-limit-saturation` | warn | A usage window was at or above 100 %, a limit was reached, or a request was refused for a limit. | none |
