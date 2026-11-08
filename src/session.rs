@@ -147,6 +147,16 @@ pub struct ToolStat {
     pub result_chars_max: u64,
 }
 
+/// File reads: `Read` calls and shell commands recognised as file reads, as
+/// file-reread recognises them.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct Reads {
+    pub calls: u64,
+    /// Characters of their results (Claude: tool result text; Codex: the
+    /// command's recorded output).
+    pub result_chars: u64,
+}
+
 /// Codex `item_completed` operations (shell commands, MCP calls, web actions).
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct OpStat {
@@ -298,6 +308,10 @@ pub struct Session {
     pub max_prompt_tokens: Option<u64>,
     pub context_window: Option<u64>,
     pub tools: BTreeMap<String, ToolStat>,
+    /// `None` when no transcript was read (T3 records, a missing Codex
+    /// rollout), or in a scan written before agentprof recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads: Option<Reads>,
     pub error_basis: String,
     pub operations: BTreeMap<String, OpStat>,
     /// Web requests by host, then by status (HTTP code or failure class).
@@ -348,6 +362,7 @@ impl Session {
             max_prompt_tokens: None,
             context_window: None,
             tools: BTreeMap::new(),
+            reads: None,
             error_basis: String::new(),
             operations: BTreeMap::new(),
             web: BTreeMap::new(),
