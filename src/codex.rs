@@ -431,35 +431,9 @@ fn read_range(cmd: Option<&str>) -> String {
         return "unknown".into();
     };
     let words: Vec<&str> = cmd.split_whitespace().collect();
-    match words.first().copied() {
-        Some("cat") if words[1..].iter().all(|w| !w.starts_with('-')) => "whole".into(),
-        Some("nl")
-            if words[1..]
-                .iter()
-                .all(|w| !w.starts_with('-') || *w == "-ba") =>
-        {
-            "whole".into()
-        }
-        Some("sed") if words.get(1) == Some(&"-n") => {
-            let script = words
-                .get(2)
-                .map(|w| w.trim_matches(|c| c == '\'' || c == '"'));
-            let range = script.and_then(|sc| {
-                let body = sc.strip_suffix('p')?;
-                let (a, b) = body.split_once(',').unwrap_or((body, body));
-                let number = |s: &str| {
-                    s.bytes()
-                        .all(|c| c.is_ascii_digit())
-                        .then(|| s.parse::<u64>().ok())
-                        .flatten()
-                };
-                let (a, b) = (number(a)?, number(b)?);
-                Some(format!("lines {a}-{b}"))
-            });
-            range.unwrap_or_else(|| format!("cmd:{cmd}"))
-        }
-        _ => format!("cmd:{cmd}"),
-    }
+    crate::util::read_command(&words)
+        .map(|(range, _)| range)
+        .unwrap_or_else(|| format!("cmd:{cmd}"))
 }
 
 #[derive(Deserialize)]
