@@ -18,6 +18,10 @@ cargo build --release
 
 The crate needs Rust 1.99 or later (edition 2024). SQLite is bundled.
 
+## Versioning
+
+Every pull request that changes the tool's behaviour raises the version in `Cargo.toml` and `Cargo.lock`.
+
 ## Commands
 
 ### `agentprof scan`
