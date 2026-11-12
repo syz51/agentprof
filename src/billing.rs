@@ -1,5 +1,10 @@
 //! The API-routing log (`decisions.jsonl`): one line per Claude Code launch
 //! saying whether it ran on the subscription or the API.
+//!
+//! The log also holds lines that are not launch decisions: `refused` (an
+//! earlier run was refused, written after that run) and `cost` (a run's
+//! cost). They describe a run that already started, so they never set a
+//! session's billing mode; `Log` counts them as `other_lines`.
 
 use std::path::Path;
 
@@ -26,6 +31,8 @@ pub struct Decision {
 pub struct Log {
     pub decisions: Vec<Decision>,
     pub bad_lines: u64,
+    /// Valid lines that are not launch decisions (`refused`, `cost`).
+    pub other_lines: u64,
     pub first: Option<i64>,
     pub last: Option<i64>,
 }
@@ -33,6 +40,12 @@ pub struct Log {
 /// A decision applies to a session that starts in the same directory within
 /// this many milliseconds after it.
 pub const WINDOW_MS: i64 = 120_000;
+
+/// Modes the router writes when it launches a run.
+const LAUNCH_MODES: [&str; 3] = ["api", "subscription", "passthrough"];
+
+/// Modes the router writes for something other than a launch.
+const OTHER_MODES: [&str; 2] = ["refused", "cost"];
 
 impl Log {
     pub fn load(path: &Path) -> Result<Log> {
@@ -48,6 +61,17 @@ impl Log {
                 log.bad_lines += 1;
                 continue;
             };
+            match r.mode.as_deref() {
+                Some(m) if LAUNCH_MODES.contains(&m) => {}
+                Some(m) if OTHER_MODES.contains(&m) => {
+                    log.other_lines += 1;
+                    continue;
+                }
+                _ => {
+                    log.bad_lines += 1;
+                    continue;
+                }
+            }
             let (Some(at), Some(mode), Some(cwd)) =
                 (r.at.as_deref().and_then(parse_ts), r.mode, r.cwd)
             else {
@@ -98,5 +122,23 @@ not json
         assert!(log.lookup("/q", t0).is_none());
         let late = parse_ts("2026-01-01T00:05:00Z").unwrap();
         assert!(log.lookup("/p", late).is_none());
+    }
+
+    #[test]
+    fn refused_and_cost_lines_are_not_decisions() {
+        // The router writes `refused` after a refused run and `cost` at a
+        // run's end; neither may label a session that starts soon after.
+        let log = Log::parse(
+            r#"{"at":"2026-01-01T00:00:00Z","mode":"api","reason":"ok","cwd":"/p"}
+{"at":"2026-01-01T00:00:20Z","mode":"refused","reason":"exhausted","cwd":"/p"}
+{"at":"2026-01-01T00:00:21Z","mode":"cost","session":"s","costUSD":0.01,"source":"result"}
+{"at":"2026-01-01T00:00:22Z","mode":"other","reason":"x","cwd":"/p"}
+"#,
+        );
+        assert_eq!(log.decisions.len(), 1);
+        assert_eq!(log.other_lines, 2);
+        assert_eq!(log.bad_lines, 1);
+        let t = parse_ts("2026-01-01T00:00:30Z").unwrap();
+        assert_eq!(log.lookup("/p", t).unwrap().mode, "api");
     }
 }

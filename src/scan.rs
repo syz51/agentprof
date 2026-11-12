@@ -1088,6 +1088,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             "present": true,
             "decisions": log.decisions.len(),
             "bad_lines": log.bad_lines,
+            "other_lines": log.other_lines,
             "range": range,
             "decisions_in_project": log.in_project(root),
             "claude_sessions_matched_by_mode": matched,
@@ -1150,8 +1151,6 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
 
     // ---- Write.
     std::fs::create_dir_all(&inp.out).with_context(|| format!("creating {}", inp.out.display()))?;
-    write_jsonl(&inp.out.join("sessions.jsonl"), &sessions)?;
-    write_jsonl(&inp.out.join("findings.jsonl"), &findings)?;
     let errors = findings.iter().filter(|f| f.severity == "error").count();
     let archive_totals = {
         let known: Vec<_> = sessions.iter().filter_map(|s| s.archive.as_ref()).collect();
@@ -1206,9 +1205,16 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
         "findings": findings.len(),
         "error_findings": errors,
     });
-    let mut f = std::fs::File::create(inp.out.join("scan.json"))?;
-    serde_json::to_writer_pretty(&mut f, &scan)?;
-    f.write_all(b"\n")?;
+    let mut scan_bytes = serde_json::to_vec_pretty(&scan)?;
+    scan_bytes.push(b'\n');
+    write_outputs(
+        &inp.out,
+        &[
+            ("sessions.jsonl", jsonl_bytes(&sessions)?),
+            ("findings.jsonl", jsonl_bytes(&findings)?),
+            ("scan.json", scan_bytes),
+        ],
+    )?;
 
     // ---- stdout.
     let mut out = std::io::stdout().lock();
@@ -1242,20 +1248,91 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
     Ok(Outcome { errors })
 }
 
-fn write_jsonl<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
-    let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    let mut w = std::io::BufWriter::new(f);
+fn jsonl_bytes<T: Serialize>(rows: &[T]) -> Result<Vec<u8>> {
+    let mut w = Vec::new();
     for r in rows {
         serde_json::to_writer(&mut w, r)?;
-        w.write_all(b"\n")?;
+        w.push(b'\n');
     }
-    w.flush()?;
+    Ok(w)
+}
+
+/// Writes one scan's files into `dir` so that a stop never leaves a mix of
+/// two scans: every file goes to a hidden temporary name first, and the
+/// files are renamed into place only after all of them are written, in the
+/// given order. A failed write removes the temporary files and leaves the
+/// previous scan untouched.
+fn write_outputs(dir: &Path, files: &[(&str, Vec<u8>)]) -> Result<()> {
+    let tmp = |name: &str| dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let staged = files.iter().try_for_each(|(name, bytes)| -> Result<()> {
+        let p = tmp(name);
+        let mut f =
+            std::fs::File::create(&p).with_context(|| format!("creating {}", p.display()))?;
+        f.write_all(bytes)
+            .and_then(|()| f.sync_all())
+            .with_context(|| format!("writing {}", p.display()))
+    });
+    if let Err(e) = staged {
+        for (name, _) in files {
+            // Best effort: the write error above is the one to report.
+            let _ = std::fs::remove_file(tmp(name));
+        }
+        return Err(e);
+    }
+    for (name, _) in files {
+        let to = dir.join(name);
+        std::fs::rename(tmp(name), &to).with_context(|| format!("replacing {}", to.display()))?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outputs(n: &str) -> [(&'static str, Vec<u8>); 3] {
+        [
+            ("sessions.jsonl", format!("sessions {n}\n").into_bytes()),
+            ("findings.jsonl", format!("findings {n}\n").into_bytes()),
+            ("scan.json", format!("scan {n}\n").into_bytes()),
+        ]
+    }
+
+    fn read_outputs(dir: &Path) -> Vec<String> {
+        ["sessions.jsonl", "findings.jsonl", "scan.json"]
+            .iter()
+            .map(|f| std::fs::read_to_string(dir.join(f)).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_scan_stopped_between_files_leaves_the_earlier_scan_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        write_outputs(dir.path(), &outputs("1")).unwrap();
+        // The second file cannot be written: a directory holds its
+        // temporary name. The scan stops after writing the first file.
+        let blocker = dir
+            .path()
+            .join(format!(".findings.jsonl.{}.tmp", std::process::id()));
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(write_outputs(dir.path(), &outputs("2")).is_err());
+        assert_eq!(
+            read_outputs(dir.path()),
+            ["sessions 1\n", "findings 1\n", "scan 1\n"]
+        );
+        std::fs::remove_dir(&blocker).unwrap();
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "temporary files left: {left:?}");
+        write_outputs(dir.path(), &outputs("3")).unwrap();
+        assert_eq!(
+            read_outputs(dir.path()),
+            ["sessions 3\n", "findings 3\n", "scan 3\n"]
+        );
+    }
 
     #[test]
     fn union_merges_overlaps() {

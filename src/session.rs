@@ -233,7 +233,7 @@ pub struct Cost {
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Billing {
-    /// `subscription`, `api`, `refused` or `unknown`.
+    /// `subscription`, `api`, `passthrough` or `unknown`.
     pub mode: String,
     pub basis: String,
     pub plan_type: Option<String>,
