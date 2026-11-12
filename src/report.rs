@@ -531,6 +531,8 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
         let _ = writeln!(o);
     }
 
+    archive_section(&mut o, &scan["archive"], &sessions, top);
+
     // ---- Web requests.
     let _ = writeln!(o, "## Web requests and blocked access\n");
     let _ = writeln!(
@@ -775,6 +777,107 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
         serde_json::to_string_pretty(&g(&["cross_checks"]))?
     );
     Ok(o)
+}
+
+/// A share in `[0, 1]` as a percentage, or `–` when it is unknown.
+fn share(v: Option<f64>) -> String {
+    v.map_or_else(|| "–".into(), |f| format!("{:.1}%", f * 100.0))
+}
+
+/// Archive lookups: the totals in `scan.json`'s `archive` object and the
+/// sessions with the most archive greps. Column names are the fields of a
+/// session's `archive` object, which lab reads as metric paths.
+fn archive_section(o: &mut String, a: &Value, sessions: &[Session], top: usize) {
+    let _ = writeln!(o, "## Archive lookups\n");
+    if !a.is_object() {
+        let _ = writeln!(
+            o,
+            "Not recorded: this scan predates archive counts (agentprof 0.3.0).\n"
+        );
+        return;
+    }
+    let n = |k: &str| a[k].as_u64().map_or_else(|| "–".into(), num);
+    let roots: Vec<String> = a["roots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|r| format!("`{r}`"))
+        .collect();
+    if roots.is_empty() {
+        let _ = writeln!(
+            o,
+            "No archive root is set, so `greps`, `reads`, `search_share` and `grep_share` are not counted. Set a root with `--archive-root DIR`, `[agentprof] archive_roots` or `[lab.archive] start` in `research.toml`. Columns are the session record's `archive` fields; lab reads each as `agentprof:session.archive.<field>`.\n"
+        );
+        let _ = writeln!(
+            o,
+            "| Sessions | searches | opens | related | no_hit_searches |"
+        );
+        let _ = writeln!(o, "|---:|---:|---:|---:|---:|");
+        let _ = writeln!(
+            o,
+            "| {} | {} | {} | {} | {} |\n",
+            n("sessions"),
+            n("searches"),
+            n("opens"),
+            n("related"),
+            n("no_hit_searches")
+        );
+        return;
+    }
+    let _ = writeln!(
+        o,
+        "Archive roots: {} (from {}). Columns are the session record's `archive` fields; lab reads each as `agentprof:session.archive.<field>`. The shares are over `searches + greps`.\n",
+        roots.join(", "),
+        a["roots_basis"].as_str().unwrap_or("unknown")
+    );
+    let _ = writeln!(
+        o,
+        "| Sessions | searches | opens | related | no_hit_searches | greps | reads | search_share | grep_share |"
+    );
+    let _ = writeln!(o, "|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    let _ = writeln!(
+        o,
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        n("sessions"),
+        n("searches"),
+        n("opens"),
+        n("related"),
+        n("no_hit_searches"),
+        n("greps"),
+        n("reads"),
+        share(a["search_share"].as_f64()),
+        share(a["grep_share"].as_f64())
+    );
+    let mut rows: Vec<_> = sessions
+        .iter()
+        .filter_map(|s| Some((s, s.archive.as_ref()?)))
+        .filter(|(_, x)| x.greps.unwrap_or(0) > 0)
+        .collect();
+    if rows.is_empty() {
+        let _ = writeln!(o, "No session grepped the archive.\n");
+        return;
+    }
+    rows.sort_by(|(s, x), (t, y)| y.greps.cmp(&x.greps).then(s.key().cmp(&t.key())));
+    let _ = writeln!(o, "Top {top} sessions by archive greps:\n");
+    let _ = writeln!(
+        o,
+        "| Session | Role | searches | greps | reads | grep_share |"
+    );
+    let _ = writeln!(o, "|---|---|---:|---:|---:|---:|");
+    for (s, x) in rows.into_iter().take(top) {
+        let _ = writeln!(
+            o,
+            "| `{}` | {} | {} | {} | {} | {} |",
+            s.key(),
+            s.role,
+            num(x.searches),
+            x.greps.map_or_else(|| "–".into(), num),
+            x.reads.map_or_else(|| "–".into(), num),
+            share(x.grep_share)
+        );
+    }
+    let _ = writeln!(o);
 }
 
 fn top_table<'a>(o: &mut String, rows: impl Iterator<Item = &'a Session>) {

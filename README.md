@@ -94,6 +94,7 @@ Renders a Markdown summary of a scan directory. It covers:
 - Long-context pricing: per model, the priced requests, how many had prompts over the model's long-context threshold, the surcharge the tier added over standard rates, and the cost of all the model's requests.
 - Top sessions by tokens and by wall time.
 - Tools and Codex operations.
+- Archive lookups: the roots and their origin, the totals of the `archive` fields with both shares, and the sessions with the most archive greps. Without a root it shows the search counts only and says that no root is set.
 - Web statuses and failing hosts.
 - Errors, rate limits, compactions and aborts.
 - T3 runs and linkage.

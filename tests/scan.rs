@@ -495,6 +495,15 @@ fn scan_and_report_end_to_end() {
     let lc = &md[md.find("## Long-context pricing").unwrap()..md.find("## Billing mode").unwrap()];
     assert!(lc.contains("Not recorded"), "{lc}");
     assert!(!lc.contains("| none |") && !lc.contains("| 0 |"), "{lc}");
+    // A scan before 0.3.0 has no archive totals: the report says so.
+    let mut sj = scan_json(&out);
+    sj.as_object_mut().unwrap().remove("archive");
+    std::fs::write(out.join("scan.json"), sj.to_string()).unwrap();
+    let md = report(&out);
+    assert!(
+        md.contains("## Archive lookups\n\nNot recorded: this scan predates archive counts"),
+        "{md}"
+    );
 }
 
 #[test]
@@ -559,6 +568,22 @@ fn scan(root: &Path, args: &[&str]) -> std::process::Output {
         .args(["--timezone", "UTC", "--billing-log", "/nonexistent/c.jsonl"])
         .output()
         .unwrap()
+}
+
+/// `agentprof report` of a scan directory; it must exit 0.
+fn report(out: &Path) -> String {
+    let res = Command::new(env!("CARGO_BIN_EXE_agentprof"))
+        .arg("report")
+        .arg(out)
+        .output()
+        .unwrap();
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    String::from_utf8(res.stdout).unwrap()
 }
 
 fn scan_json(out: &Path) -> Value {
@@ -826,6 +851,27 @@ fn archive_lookups_are_counted_under_the_configured_root() {
     );
     assert_eq!(sj["archive"]["greps"], 4);
     assert_eq!(sj["archive"]["searches"], 5);
+    // The report shows the roots, the totals with both shares, and the
+    // sessions with the most archive greps.
+    let md = report(&repo.join("out"));
+    assert!(
+        md.contains(
+            "## Archive lookups\n\nArchive roots: `docs/research` (from directory of [lab.archive] start)."
+        ),
+        "{md}"
+    );
+    assert!(md.contains(
+        "| Sessions | searches | opens | related | no_hit_searches | greps | reads | search_share | grep_share |"
+    ));
+    assert!(
+        md.contains("| 1 | 5 | 1 | 1 | 1 | 4 | 2 | 55.6% | 44.4% |"),
+        "{md}"
+    );
+    assert!(md.contains("Top 10 sessions by archive greps:"), "{md}");
+    assert!(
+        md.contains("| `claude:s1` | main | 5 | 4 | 2 | 44.4% |"),
+        "{md}"
+    );
 
     // `[agentprof] archive_roots` replaces it; the flag replaces both.
     std::fs::write(
@@ -868,6 +914,26 @@ fn archive_lookups_are_counted_under_the_configured_root() {
     assert!(s["archive"]["search_share"].is_null());
     assert!(sj["archive"]["greps"].is_null());
     assert_eq!(sj["archive"]["roots_basis"], "none");
+    // The report then shows the searches only and says that no root is set.
+    let md = report(&repo.join("out"));
+    let section = md
+        .split("## Archive lookups\n\n")
+        .nth(1)
+        .unwrap()
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(section.starts_with("No archive root is set,"), "{section}");
+    assert!(
+        section.contains(
+            "| Sessions | searches | opens | related | no_hit_searches |\n|---:|---:|---:|---:|---:|\n| 1 | 5 | 1 | 1 | 1 |\n"
+        ),
+        "{section}"
+    );
+    assert!(
+        !section.contains("greps |") && !section.contains("Top "),
+        "{section}"
+    );
 }
 
 /// A Codex rollout file name in the session directories' scheme.
