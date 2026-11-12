@@ -507,6 +507,7 @@ pub struct Ctx<'a> {
     pub include_titles: bool,
     pub large_output_chars: u64,
     pub context_ratio: f64,
+    pub archive: &'a crate::archive::Config,
 }
 
 /// Per-thread numbers for the cross-check against `threads.tokens_used`.
@@ -626,6 +627,8 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
     }
 
     s.reads = Some(Reads::default());
+    let mut arch = crate::archive::Counter::new(cx.archive);
+    arch.see_cwd(&th.cwd);
     let mut total = Acc::default();
     let mut prev: Option<Usage> = None;
     let mut model = th.model.clone();
@@ -990,7 +993,7 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
                             else {
                                 continue;
                             };
-                            item(&mut s, &mut tr, it, ln);
+                            item(&mut s, &mut tr, &mut arch, &th.cwd, it, ln);
                         }
                         _ => {}
                     }
@@ -1007,6 +1010,7 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
                                 _ => ri.kind.clone().unwrap_or_default(),
                             };
                             s.tools.entry(name.clone()).or_default().calls += 1;
+                            arch.tool(&name);
                             if is_poll(&name) {
                                 *tr.polls.entry(name.clone()).or_default() += 1;
                             }
@@ -1180,7 +1184,7 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
     s.open_turns = open_turns;
     s.active_ms = (timed > 0 && !incomplete).then_some(active);
     s.active_basis = "codex: sum of task_complete/turn_aborted duration_ms; a turn without one counts from its task_started to the last record before the next turn".into();
-    s.error_basis = "codex: tool output starting 'Script failed' or 'aborted'; operations: status failed or non-zero exit".into();
+    s.error_basis = "codex: tool output starting 'Script failed' or 'aborted'; operations: status failed or non-zero exit, except an archive query (lab search, lab archive find) that exits 1 with no hit".into();
     if incomplete {
         s.set_span(start.or(th.created_ms), None);
     } else {
@@ -1191,6 +1195,7 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
         transcript.segments.clear();
     }
     s.transcript = Some(transcript);
+    s.archive = Some(arch.finish());
     Parsed {
         session: s,
         trace: tr,
@@ -1202,7 +1207,14 @@ pub fn parse(th: &Thread, segments: &[Rollout], cx: &Ctx) -> Parsed {
     }
 }
 
-fn item(s: &mut Session, tr: &mut Trace, it: Item, ln: u64) {
+fn item(
+    s: &mut Session,
+    tr: &mut Trace,
+    arch: &mut crate::archive::Counter,
+    cwd: &str,
+    it: Item,
+    ln: u64,
+) {
     let kind = it.kind.as_deref().unwrap_or("unknown");
     let key = match kind {
         "CommandExecution" => "command".to_string(),
@@ -1218,9 +1230,20 @@ fn item(s: &mut Session, tr: &mut Trace, it: Item, ln: u64) {
         "Reasoning" | "AgentMessage" | "UserMessage" | "ContextCompaction" => return,
         other => other.to_string(),
     };
+    let cmd = match kind {
+        "CommandExecution" => it.command.as_ref().and_then(command_text),
+        _ => None,
+    };
+    // An archive query exits 1 when nothing matches: an answer, not a failure.
+    let no_hit =
+        cmd.as_deref().is_some_and(|c| arch.shell(c, Some(cwd))) && it.exit_code == Some(1);
+    if no_hit {
+        arch.no_hit();
+    }
     let failed = match kind {
         "CommandExecution" => {
-            it.status.as_deref() == Some("failed") || it.exit_code.is_some_and(|c| c != 0)
+            !no_hit
+                && (it.status.as_deref() == Some("failed") || it.exit_code.is_some_and(|c| c != 0))
         }
         "McpToolCall" => {
             it.status.as_deref().is_some_and(|s| s != "completed")
@@ -1251,8 +1274,8 @@ fn item(s: &mut Session, tr: &mut Trace, it: Item, ln: u64) {
         _ => {}
     }
     if kind == "CommandExecution" {
-        if let Some(cmd) = it.command.as_ref().and_then(command_text) {
-            tr.command(&cmd, ln);
+        if let Some(cmd) = &cmd {
+            tr.command(cmd, ln);
         }
         let mut read = false;
         for pc in it.parsed_cmd.iter().flatten() {
@@ -1260,6 +1283,9 @@ fn item(s: &mut Session, tr: &mut Trace, it: Item, ln: u64) {
                 && let Some(p) = &pc.path
             {
                 tr.read(p, &read_range(pc.cmd.as_deref()), ln);
+                if let Some(p) = crate::util::resolve_path(Some(cwd), p) {
+                    arch.read(&p);
+                }
                 read = true;
             }
         }
@@ -1322,6 +1348,7 @@ mod tests {
             include_titles: false,
             large_output_chars: 100_000,
             context_ratio: 0.9,
+            archive: &crate::archive::TEST,
         }
     }
 
@@ -1369,6 +1396,36 @@ mod tests {
             Some(s) => format!("rollout-{ts}-{thread}_{s}.jsonl"),
             None => format!("rollout-{ts}-{thread}.jsonl"),
         }
+    }
+
+    #[test]
+    fn archive_lookups_and_no_hit_searches() {
+        let th = thread("t1", "vscode");
+        let cmd = |ord: u64, cmd: &str, status: &str, code: i64, parsed: &str| {
+            format!(
+                r#"{{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","ordinal":{ord},"payload":{{"type":"item_completed","item":{{"type":"CommandExecution","status":"{status}","exit_code":{code},"command":["/bin/zsh","-lc","{cmd}"],"parsed_cmd":[{parsed}]}}}}}}"#
+            )
+        };
+        let b = rollout(&[
+            meta(0, "t1", ""),
+            cmd(1, "lab search nothing", "failed", 1, ""),
+            cmd(2, "lab archive find x | head", "completed", 0, ""),
+            cmd(3, "lab search", "failed", 2, ""),
+            cmd(4, "grep -rn x docs/research", "failed", 1, ""),
+            cmd(5, "grep -rn x src", "completed", 0, ""),
+            cmd(6, "cat docs/research/a.md", "completed", 0, r#"{"type":"read","path":"docs/research/a.md","cmd":"cat docs/research/a.md"}"#),
+            cmd(7, "cat a.md", "completed", 0, r#"{"type":"read","path":"a.md","cmd":"cat a.md"}"#),
+            r#"{"timestamp":"2026-01-01T00:00:04Z","type":"response_item","ordinal":8,"payload":{"type":"function_call","name":"archive_open","namespace":"mcp__lab","call_id":"c1"}}"#.into(),
+        ]);
+        let p = run(&th, &b);
+        let a = p.session.archive.as_ref().unwrap();
+        assert_eq!((a.searches, a.opens, a.no_hit_searches), (4, 1, 1));
+        assert_eq!((a.greps, a.reads), (Some(1), Some(1)));
+        assert_eq!(a.search_share, Some(0.8));
+        // The no-hit search is not a failed command; the usage error and
+        // the grep without a match are.
+        let op = &p.session.operations["command"];
+        assert_eq!((op.count, op.failed), (7, 2));
     }
 
     #[test]

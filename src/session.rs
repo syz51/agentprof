@@ -157,6 +157,34 @@ pub struct Reads {
     pub result_chars: u64,
 }
 
+/// Archive lookups: calls of the archive search tools, greps over the
+/// archive and reads of archive files. The README states what counts.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct Archive {
+    /// Calls of `lab search`, `lab open`, `lab related` and `lab archive
+    /// find`, and of the MCP tools `archive_search`, `archive_open` and
+    /// `archive_related`.
+    pub searches: u64,
+    /// The `lab open` and `archive_open` calls among `searches`.
+    pub opens: u64,
+    /// The `lab related` and `archive_related` calls among `searches`.
+    pub related: u64,
+    /// `lab search` and `lab archive find` commands that exited 1: no hit.
+    pub no_hit_searches: u64,
+    /// Greps whose paths lie under an archive root; `None` when the scan
+    /// has no archive root.
+    pub greps: Option<u64>,
+    /// File reads under an archive root; `None` when the scan has no
+    /// archive root.
+    pub reads: Option<u64>,
+    /// `searches / (searches + greps)`; `None` without an archive root or
+    /// without any lookup.
+    pub search_share: Option<f64>,
+    /// `greps / (searches + greps)`, the complement of `search_share`, for
+    /// metrics where lower is better; `None` as `search_share` is.
+    pub grep_share: Option<f64>,
+}
+
 /// Codex `item_completed` operations (shell commands, MCP calls, web actions).
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct OpStat {
@@ -312,6 +340,9 @@ pub struct Session {
     /// rollout), or in a scan written before agentprof recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reads: Option<Reads>,
+    /// `None` as for `reads`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<Archive>,
     pub error_basis: String,
     pub operations: BTreeMap<String, OpStat>,
     /// Web requests by host, then by status (HTTP code or failure class).
@@ -363,6 +394,7 @@ impl Session {
             context_window: None,
             tools: BTreeMap::new(),
             reads: None,
+            archive: None,
             error_basis: String::new(),
             operations: BTreeMap::new(),
             web: BTreeMap::new(),
