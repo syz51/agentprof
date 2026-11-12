@@ -531,6 +531,8 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
         let _ = writeln!(o);
     }
 
+    archive_section(&mut o, &scan["archive"], &sessions, top);
+
     // ---- Web requests.
     let _ = writeln!(o, "## Web requests and blocked access\n");
     let _ = writeln!(
@@ -775,6 +777,96 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
         serde_json::to_string_pretty(&g(&["cross_checks"]))?
     );
     Ok(o)
+}
+
+/// A share in `[0, 1]` as a percentage, or `–` when it is unknown.
+fn share(v: Option<f64>) -> String {
+    v.map_or_else(|| "–".into(), |f| format!("{:.1}%", f * 100.0))
+}
+
+/// Archive lookups: the totals in `scan.json`'s `archive` object and the
+/// sessions with the most archive greps. Column names are the fields of a
+/// session's `archive` object, which lab reads as metric paths.
+fn archive_section(o: &mut String, a: &Value, sessions: &[Session], top: usize) {
+    let _ = writeln!(o, "## Archive lookups\n");
+    if !a.is_object() {
+        let _ = writeln!(
+            o,
+            "Not recorded: this scan predates archive counts (agentprof 0.3.0).\n"
+        );
+        return;
+    }
+    let n = |k: &str| a[k].as_u64().map_or_else(|| "–".into(), num);
+    let roots: Vec<String> = a["roots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|r| format!("`{r}`"))
+        .collect();
+    let lookup = "Columns are the session record's `archive` fields; lab reads each as `agentprof:session.archive.<field>`.";
+    let mut cols = vec![
+        ("Sessions", n("sessions")),
+        ("searches", n("searches")),
+        ("opens", n("opens")),
+        ("related", n("related")),
+        ("no_hit_searches", n("no_hit_searches")),
+    ];
+    if roots.is_empty() {
+        let _ = writeln!(
+            o,
+            "No archive root is set, so `greps`, `reads`, `search_share` and `grep_share` are not counted. Set a root with `--archive-root DIR`, `[agentprof] archive_roots` or `[lab.archive] start` in `research.toml`. {lookup}\n"
+        );
+    } else {
+        let _ = writeln!(
+            o,
+            "Archive roots: {} (from {}). {lookup} The shares are over `searches + greps`.\n",
+            roots.join(", "),
+            a["roots_basis"].as_str().unwrap_or("unknown")
+        );
+        cols.extend([
+            ("greps", n("greps")),
+            ("reads", n("reads")),
+            ("search_share", share(a["search_share"].as_f64())),
+            ("grep_share", share(a["grep_share"].as_f64())),
+        ]);
+    }
+    let row = |cells: Vec<&str>| format!("| {} |", cells.join(" | "));
+    let _ = writeln!(o, "{}", row(cols.iter().map(|c| c.0).collect()));
+    let _ = writeln!(o, "|{}", "---:|".repeat(cols.len()));
+    let _ = writeln!(o, "{}\n", row(cols.iter().map(|c| c.1.as_str()).collect()));
+    if roots.is_empty() {
+        return;
+    }
+    let mut rows: Vec<_> = sessions
+        .iter()
+        .filter_map(|s| Some((s, s.archive.as_ref()?)))
+        .filter(|(_, x)| x.greps.unwrap_or(0) > 0)
+        .collect();
+    if rows.is_empty() {
+        let _ = writeln!(o, "No session grepped the archive.\n");
+        return;
+    }
+    rows.sort_by(|(s, x), (t, y)| y.greps.cmp(&x.greps).then(s.key().cmp(&t.key())));
+    let _ = writeln!(o, "Top {top} sessions by archive greps:\n");
+    let _ = writeln!(
+        o,
+        "| Session | Role | searches | greps | reads | grep_share |"
+    );
+    let _ = writeln!(o, "|---|---|---:|---:|---:|---:|");
+    for (s, x) in rows.into_iter().take(top) {
+        let _ = writeln!(
+            o,
+            "| `{}` | {} | {} | {} | {} | {} |",
+            s.key(),
+            s.role,
+            num(x.searches),
+            x.greps.map_or_else(|| "–".into(), num),
+            x.reads.map_or_else(|| "–".into(), num),
+            share(x.grep_share)
+        );
+    }
+    let _ = writeln!(o);
 }
 
 fn top_table<'a>(o: &mut String, rows: impl Iterator<Item = &'a Session>) {
