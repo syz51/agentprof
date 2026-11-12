@@ -66,6 +66,10 @@ pub struct ScanArgs {
     /// Pricing file [default: the built-in pricing.toml]
     #[arg(long)]
     pub pricing: Option<PathBuf>,
+    /// Archive root, absolute or relative to the project root; repeat for several
+    /// [default: research.toml `[agentprof] archive_roots`, else the directory of `[lab.archive] start`]
+    #[arg(long = "archive-root", value_name = "DIR")]
+    pub archive_roots: Vec<String>,
     /// IANA time zone for per-day breakdowns [default: research.toml, else the system zone]
     #[arg(long)]
     pub timezone: Option<String>,
@@ -88,6 +92,20 @@ struct ResearchToml {
     project: ProjectTable,
     #[serde(default)]
     agentprof: AgentprofTable,
+    #[serde(default)]
+    lab: LabTable,
+}
+
+/// The one key of lab's table that agentprof reads: the archive's start page.
+#[derive(Deserialize, Default)]
+struct LabTable {
+    #[serde(default)]
+    archive: LabArchiveTable,
+}
+
+#[derive(Deserialize, Default)]
+struct LabArchiveTable {
+    start: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -107,6 +125,7 @@ struct AgentprofTable {
     t3_db: Option<PathBuf>,
     billing_log: Option<PathBuf>,
     pricing: Option<PathBuf>,
+    archive_roots: Option<Vec<String>>,
 }
 
 fn find_config(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
@@ -149,6 +168,9 @@ struct Inputs {
     tz: TimeZone,
     tz_name: String,
     config: Option<PathBuf>,
+    archive: crate::archive::Config,
+    /// Where the archive roots come from.
+    archive_basis: &'static str,
 }
 
 /// The absolute form of `p` with `.` and `..` removed lexically (symlinks
@@ -196,6 +218,31 @@ fn resolve(a: &ScanArgs) -> Result<Inputs> {
     };
     let root = normalise_root(&root.to_string_lossy());
     let ap = cfg.agentprof;
+    let (archive_roots, archive_basis) = if !a.archive_roots.is_empty() {
+        (a.archive_roots.clone(), "--archive-root")
+    } else if let Some(r) = ap.archive_roots {
+        (r, "[agentprof] archive_roots")
+    } else if let Some(start) = cfg.lab.archive.start {
+        let dir = Path::new(&start).parent().unwrap_or(Path::new(""));
+        (
+            vec![dir.to_string_lossy().into_owned()],
+            "directory of [lab.archive] start",
+        )
+    } else {
+        (Vec::new(), "none")
+    };
+    let archive = crate::archive::Config {
+        project: root.clone(),
+        roots: archive_roots
+            .iter()
+            // An empty root (a start page in the project root) is the
+            // project root itself.
+            .map(|r| match r.as_str() {
+                "" => ".".to_string(),
+                r => normalise_root(r),
+            })
+            .collect(),
+    };
     let out = a
         .out
         .clone()
@@ -252,6 +299,8 @@ fn resolve(a: &ScanArgs) -> Result<Inputs> {
         tz,
         tz_name,
         config,
+        archive,
+        archive_basis,
     })
 }
 
@@ -406,6 +455,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             include_titles: a.include_titles,
             large_output_chars: th.large_output_chars,
             context_ratio: th.context_ratio,
+            archive: &inp.archive,
             seen: &mut seen,
             stats: &mut claude_stats,
         };
@@ -621,6 +671,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             include_titles: a.include_titles,
             large_output_chars: th.large_output_chars,
             context_ratio: th.context_ratio,
+            archive: &inp.archive,
         };
         // Earlier segments of resumed threads are not in the database.
         let seg_index = if selected.is_empty() {
@@ -1102,6 +1153,27 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
     write_jsonl(&inp.out.join("sessions.jsonl"), &sessions)?;
     write_jsonl(&inp.out.join("findings.jsonl"), &findings)?;
     let errors = findings.iter().filter(|f| f.severity == "error").count();
+    let archive_totals = {
+        let known: Vec<_> = sessions.iter().filter_map(|s| s.archive.as_ref()).collect();
+        let searches: u64 = known.iter().map(|a| a.searches).sum();
+        let greps = (!inp.archive.roots.is_empty())
+            .then(|| known.iter().filter_map(|a| a.greps).sum::<u64>());
+        let reads = (!inp.archive.roots.is_empty())
+            .then(|| known.iter().filter_map(|a| a.reads).sum::<u64>());
+        json!({
+            "roots": inp.archive.roots.iter().map(|r| tilde(r)).collect::<Vec<_>>(),
+            "roots_basis": inp.archive_basis,
+            "sessions": known.len(),
+            "searches": searches,
+            "opens": known.iter().map(|a| a.opens).sum::<u64>(),
+            "related": known.iter().map(|a| a.related).sum::<u64>(),
+            "no_hit_searches": known.iter().map(|a| a.no_hit_searches).sum::<u64>(),
+            "greps": greps,
+            "reads": reads,
+            "search_share": greps.and_then(|g| ratio(searches, searches + g)),
+            "grep_share": greps.and_then(|g| ratio(g, searches + g)),
+        })
+    };
     let scan = json!({
         "schema": SCAN_SCHEMA,
         "tool": "agentprof",
@@ -1120,6 +1192,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
         },
         "thresholds": th,
         "inputs": inputs,
+        "archive": archive_totals,
         "coverage": coverage,
         "cross_checks": checks,
         "active_union_ms": {

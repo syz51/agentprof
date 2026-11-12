@@ -653,6 +653,223 @@ fn relative_config_and_dotdot_project_resolve_to_the_real_root() {
     assert!(!scan_json(&out2)["project"].as_str().unwrap().contains(".."));
 }
 
+/// One Claude tool call and its result, as two transcript lines.
+fn tool_lines(n: u32, cwd: &Path, name: &str, input: &str, error: bool, result: &str) -> String {
+    let cwd = cwd.display();
+    format!(
+        r#"{{"type":"assistant","uuid":"a{n}","requestId":"r{n}","sessionId":"s1","cwd":"{cwd}","timestamp":"2026-01-01T00:00:00Z","message":{{"id":"m{n}","model":"claude-haiku-5-5","content":[{{"type":"tool_use","id":"t{n}","name":"{name}","input":{input}}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}}}
+{{"type":"user","uuid":"u{n}","sessionId":"s1","cwd":"{cwd}","timestamp":"2026-01-01T00:00:01Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t{n}","is_error":{error},"content":"{result}"}}]}}}}
+"#
+    )
+}
+
+#[test]
+fn archive_lookups_are_counted_under_the_configured_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let lab_only = "[agentprof]\nout = \"out\"\n\n[lab]\nfindings = \"x\"\n\n[lab.archive]\nstart = \"docs/research/START.md\"\nsealed = [\"docs/research/log-*.md\"]\n";
+    std::fs::write(repo.join("research.toml"), lab_only).unwrap();
+    let bash = |cmd: &str| format!(r#"{{"command":"{cmd}"}}"#);
+    let archive = repo.join("docs/research");
+    let transcript = [
+        // Searches: one with no hit (exit 1), one behind a pipe, an open, an MCP call.
+        tool_lines(
+            1,
+            &repo,
+            "Bash",
+            &bash("lab search 'reranker gain'"),
+            true,
+            "Exit code 1\\nno record matches",
+        ),
+        tool_lines(
+            2,
+            &repo,
+            "Bash",
+            &bash("lab archive find H164 | head -5"),
+            false,
+            "H164",
+        ),
+        tool_lines(3, &repo, "Bash", &bash("lab open DR041"), false, "text"),
+        tool_lines(
+            4,
+            &repo,
+            "mcp__lab__archive_related",
+            r#"{"id":"DR041"}"#,
+            false,
+            "[]",
+        ),
+        // A failed search that is not a no-hit stays an error.
+        tool_lines(
+            5,
+            &repo,
+            "Bash",
+            &bash("lab search"),
+            true,
+            "Exit code 2\\nusage",
+        ),
+        // Archive greps: a path under the root, the working directory, the Grep tool.
+        tool_lines(
+            6,
+            &repo,
+            "Bash",
+            &bash("grep -rn 'gain' docs/research/followups | head"),
+            false,
+            "x",
+        ),
+        tool_lines(
+            7,
+            &archive,
+            "Bash",
+            &bash("rg -n gain; git grep gain -- history"),
+            false,
+            "x",
+        ),
+        tool_lines(
+            8,
+            &repo,
+            "Grep",
+            r#"{"pattern":"gain","path":"docs/research"}"#,
+            false,
+            "x",
+        ),
+        // Greps outside the root.
+        tool_lines(
+            9,
+            &repo,
+            "Bash",
+            &bash("grep -rn gain src docs/other; rg docs/research/x.md src"),
+            false,
+            "x",
+        ),
+        tool_lines(
+            10,
+            &repo,
+            "Grep",
+            r#"{"pattern":"docs/research"}"#,
+            false,
+            "x",
+        ),
+        // Reads: two in the archive (a Read and a shell read), one outside.
+        tool_lines(
+            11,
+            &repo,
+            "Read",
+            &format!(r#"{{"file_path":"{}/START.md"}}"#, archive.display()),
+            false,
+            "x",
+        ),
+        tool_lines(
+            12,
+            &repo,
+            "Bash",
+            &bash("cat docs/research/START.md"),
+            false,
+            "x",
+        ),
+        tool_lines(
+            13,
+            &repo,
+            "Read",
+            &format!(r#"{{"file_path":"{}/README.md"}}"#, repo.display()),
+            false,
+            "x",
+        ),
+    ]
+    .concat();
+    let projects = base.join("claude");
+    std::fs::create_dir_all(projects.join("-x")).unwrap();
+    std::fs::write(projects.join("-x/s1.jsonl"), transcript).unwrap();
+    let common = [
+        "--claude-dir",
+        projects.to_str().unwrap(),
+        "--codex-db",
+        "/nonexistent/a.sqlite",
+        "--t3-db",
+        "/nonexistent/b.sqlite",
+    ];
+    let run = |extra: &[&str]| {
+        let mut a = extra.to_vec();
+        a.extend_from_slice(&common);
+        let res = scan(&repo, &a);
+        assert_eq!(
+            res.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        let rows = read_jsonl(&repo.join("out/sessions.jsonl"));
+        assert_eq!(rows.len(), 1);
+        (rows[0].clone(), scan_json(&repo.join("out")))
+    };
+
+    // The root is the directory of lab's archive start page.
+    let (s, sj) = run(&[]);
+    let a = &s["archive"];
+    assert_eq!(a["searches"], 5);
+    assert_eq!(
+        (&a["opens"], &a["related"]),
+        (&Value::from(1), &Value::from(1))
+    );
+    assert_eq!(a["no_hit_searches"], 1);
+    assert_eq!(a["greps"], 4);
+    assert_eq!(a["reads"], 2);
+    assert_eq!(a["search_share"], 5.0 / 9.0);
+    assert_eq!(a["grep_share"], 4.0 / 9.0);
+    // The no-hit search is not a tool error; the usage error is.
+    assert_eq!(s["tools"]["Bash"]["errors"], 1);
+    assert_eq!(sj["archive"]["roots"], serde_json::json!(["docs/research"]));
+    assert_eq!(
+        sj["archive"]["roots_basis"],
+        "directory of [lab.archive] start"
+    );
+    assert_eq!(sj["archive"]["greps"], 4);
+    assert_eq!(sj["archive"]["searches"], 5);
+
+    // `[agentprof] archive_roots` replaces it; the flag replaces both.
+    std::fs::write(
+        repo.join("research.toml"),
+        format!("{lab_only}\n[project]\n").replace(
+            "out = \"out\"",
+            "out = \"out\"\narchive_roots = [\"docs/other\", \"src/\"]",
+        ),
+    )
+    .unwrap();
+    let (s, sj) = run(&[]);
+    assert_eq!(s["archive"]["greps"], 2);
+    assert_eq!(s["archive"]["reads"], 0);
+    assert_eq!(
+        sj["archive"]["roots"],
+        serde_json::json!(["docs/other", "src"])
+    );
+    let abs = archive.join("followups");
+    let (s, sj) = run(&["--archive-root", abs.to_str().unwrap()]);
+    assert_eq!(s["archive"]["greps"], 1);
+    assert_eq!(sj["archive"]["roots_basis"], "--archive-root");
+
+    // A start page in the project root makes the project the root; an
+    // absolute root is written with the home directory hidden.
+    std::fs::write(
+        repo.join("research.toml"),
+        "[agentprof]\nout = \"out\"\n[lab.archive]\nstart = \"START.md\"\n",
+    )
+    .unwrap();
+    let (s, sj) = run(&[]);
+    assert_eq!(sj["archive"]["roots"], serde_json::json!(["."]));
+    assert_eq!(s["archive"]["reads"], 3);
+
+    // Without a root the searches are counted and the rest is unknown.
+    std::fs::write(repo.join("research.toml"), "[agentprof]\nout = \"out\"\n").unwrap();
+    let (s, sj) = run(&[]);
+    assert_eq!(s["archive"]["searches"], 5);
+    assert!(s["archive"]["greps"].is_null());
+    assert!(s["archive"]["reads"].is_null());
+    assert!(s["archive"]["search_share"].is_null());
+    assert!(sj["archive"]["greps"].is_null());
+    assert_eq!(sj["archive"]["roots_basis"], "none");
+}
+
 /// A Codex rollout file name in the session directories' scheme.
 fn rollout_file(dir: &Path, day: &str, thread: &str, seg: Option<&str>) -> PathBuf {
     let name = match seg {

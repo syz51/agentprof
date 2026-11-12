@@ -277,6 +277,8 @@ struct Pending {
     url: Option<String>,
     /// A `Read` call or a shell read (see `shell_read`).
     read: bool,
+    /// A `Bash` call whose exit status 1 means an archive query found nothing.
+    query: bool,
 }
 
 /// Totals for the cross-check: naive per-line sums versus deduplicated sums.
@@ -300,6 +302,7 @@ pub struct Ctx<'a> {
     pub include_titles: bool,
     pub large_output_chars: u64,
     pub context_ratio: f64,
+    pub archive: &'a crate::archive::Config,
     /// Request key -> session key of its first owner.
     pub seen: &'a mut HashMap<String, String>,
     pub stats: &'a mut Stats,
@@ -507,6 +510,7 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
     };
     let mut s = Session::new("claude", &id);
     let mut reads = Reads::default();
+    let mut arch = crate::archive::Counter::new(cx.archive);
     let mut tr = Trace {
         evidence: display_path(&c.path),
         ..Trace::default()
@@ -578,6 +582,7 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
             && let Some(cwd) = &r.cwd
         {
             first_cwd = Some(cwd.clone());
+            arch.see_cwd(cwd);
         }
         if matches!(c.kind, Kind::Main)
             && matches!(kind, "user" | "assistant")
@@ -690,26 +695,39 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
                         s.tools.entry(name.clone()).or_default().calls += 1;
                         let input = b.input.as_ref();
                         let field = |k: &str| input.and_then(|v| v.get(k)).and_then(|v| v.as_str());
+                        let cwd = r.cwd.as_deref().or(first_cwd.as_deref());
+                        let mut query = false;
                         let read = match name.as_str() {
                             "Read" => {
                                 if let Some(p) = field("file_path") {
                                     tr.read(p, &read_range(input), ln);
+                                    if let Some(p) = crate::util::resolve_path(cwd, p) {
+                                        arch.read(&p);
+                                    }
                                 }
                                 true
                             }
                             "Bash" => match field("command") {
                                 Some(cmd) => {
                                     tr.command(cmd, ln);
-                                    let cwd = r.cwd.as_deref().or(first_cwd.as_deref());
+                                    query = arch.shell(cmd, cwd);
                                     let read = shell_read(cmd, cwd);
                                     if let Some((p, range)) = &read {
                                         tr.read(p, range, ln);
+                                        arch.read(p);
                                     }
                                     read.is_some()
                                 }
                                 None => false,
                             },
-                            _ => false,
+                            "Grep" => {
+                                arch.grep_tool(field("path"), cwd);
+                                false
+                            }
+                            _ => {
+                                arch.tool(&name);
+                                false
+                            }
                         };
                         if read {
                             reads.calls += 1;
@@ -724,6 +742,7 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
                                 ts,
                                 url: field("url").map(str::to_string),
                                 read,
+                                query,
                             },
                         );
                     }
@@ -779,9 +798,17 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
                             orphan_results += 1;
                             continue;
                         };
-                        let is_err = b.is_error == Some(true);
                         let (chars, body) =
                             b.content.as_deref().map(result_text).unwrap_or_default();
+                        // An archive query exits 1 when nothing matches:
+                        // an answer, not an error.
+                        let no_hit = p.query
+                            && b.is_error == Some(true)
+                            && body.lines().next().map(str::trim) == Some("Exit code 1");
+                        if no_hit {
+                            arch.no_hit();
+                        }
+                        let is_err = b.is_error == Some(true) && !no_hit;
                         let stat: &mut ToolStat = s.tools.entry(p.name.clone()).or_default();
                         stat.results += 1;
                         if is_err {
@@ -858,6 +885,7 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
         tr.intervals.push((st, lt.max(st)));
     }
     s.reads = Some(reads);
+    s.archive = Some(arch.finish());
     s.open_turns = pending.len() as u64;
     if !pending.is_empty() {
         s.notes
@@ -968,7 +996,7 @@ pub fn parse(c: &Candidate, text: &str, cx: &mut Ctx) -> Parsed {
     s.turns = (turns > 0).then_some(turns);
     s.active_ms = (timed > 0).then_some(active);
     s.active_basis = "claude: sum over turns of (last assistant or tool-result record time - prompt time); a turn starts at a non-tool-result user prompt; meta and system records do not extend a turn".into();
-    s.error_basis = "claude: tool_result is_error flag".into();
+    s.error_basis = "claude: tool_result is_error flag, except an archive query (lab search, lab archive find) that exits 1 with no hit".into();
     s.set_span(start, end);
     s.cwd = first_cwd.as_deref().map(tilde);
     if cx.include_titles {
@@ -1038,6 +1066,7 @@ this line is not json
             include_titles: false,
             large_output_chars: 100_000,
             context_ratio: 0.9,
+            archive: &crate::archive::TEST,
             seen: &mut seen,
             stats: &mut stats,
         };
@@ -1121,6 +1150,7 @@ this line is not json
             include_titles: false,
             large_output_chars: 100_000,
             context_ratio: 0.9,
+            archive: &crate::archive::TEST,
             seen: &mut seen,
             stats: &mut stats,
         };
@@ -1408,6 +1438,7 @@ this line is not json
             include_titles: false,
             large_output_chars: 100_000,
             context_ratio: 0.9,
+            archive: &crate::archive::TEST,
             seen: &mut seen,
             stats: &mut stats,
         };

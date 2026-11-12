@@ -1,5 +1,6 @@
 //! agentprof: profile coding-agent sessions (Claude Code, Codex, T3 Code).
 
+mod archive;
 mod billing;
 mod claude;
 mod codex;

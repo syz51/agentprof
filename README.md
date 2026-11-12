@@ -65,6 +65,7 @@ Flags:
 | `--t3-db` | `~/.t3/userdata/statev2.sqlite` |
 | `--billing-log` | `~/.local/state/claude-api/decisions.jsonl` |
 | `--pricing` | The built-in `pricing.toml`. |
+| `--archive-root DIR` | `[agentprof] archive_roots`, else the directory of `[lab.archive] start`. Repeat the flag for several roots. See [Archive lookups](#archive-lookups). |
 | `--timezone` | `[project] timezone`, else the system zone. Used for `by_day`. |
 | `--include-titles` | Off. Adds thread and session titles to the records. |
 | `--jobs` | Available cores, at most 8. The number of parallel Codex rollout readers. |
@@ -118,10 +119,11 @@ timezone = "Asia/Tokyo"
 [agentprof]
 out = "profile"            # relative paths resolve against this file's directory
 t3_project = "0b4c..."
+archive_roots = ["docs/research"]   # see Archive lookups
 # claude_dir, codex_db, codex_archive, codex_sessions, t3_db, billing_log, pricing
 ```
 
-Flags override the file. Unknown keys in `[agentprof]` are an error.
+Flags override the file. Unknown keys in `[agentprof]` are an error. Of the other tools' tables, agentprof reads one key: `[lab.archive] start`, the default for the archive root.
 
 ## Selection
 
@@ -165,7 +167,8 @@ One JSON object per line. The fields:
 | `max_prompt_tokens`, `context_window` | integer or null | Largest single-request prompt, and the model's window. |
 | `tools` | map of ToolStat | Per tool name: `calls`, `results`, `errors`, `latency_ms_total`, `latency_ms_max`, `result_chars_total`, `result_chars_max`. |
 | `reads` | object, absent when unknown | File reads that `file-reread` recognises: `calls`, and `result_chars` of their results. Claude: every `Read` call and each `Bash` call that is a read, with the characters of its tool result text. Codex: each `CommandExecution` with a parsed read of a file, with the characters of its recorded `aggregated_output`. That is the whole command's output, and Codex keeps at most 64 KiB of it. A Codex rollout in the legacy history mode keeps no `CommandExecution` items, so it shows no reads, as in `file-reread`. Lab can measure it as `rule: session.reads.result_chars`. Absent for T3 threads, Codex threads whose rollout is missing, and scans written before agentprof recorded it. |
-| `error_basis` | string | What counts as a tool error for this source. |
+| `archive` | object, absent when unknown | Archive lookups; see [Archive lookups](#archive-lookups). `searches`, `opens`, `related`, `no_hit_searches` (integers), and `greps`, `reads` (integers) and `search_share`, `grep_share` (numbers), which are null when the scan has no archive root. Absent as `reads` is. |
+| `error_basis` | string | What counts as a tool error for this source. An archive query (`lab search` or `lab archive find`) that exits 1 found nothing: it is not a tool error and not a failed operation. |
 | `operations` | map of OpStat | Codex `item_completed` kinds: `count`, `failed`, `duration_ms_total`, `duration_ms_max`. |
 | `web` | map | Host, then status, then count. A status is an HTTP code or a failure class: `dns`, `connect-refused`, `connection-reset`, `timeout`, `tls`, `cloudflare-challenge`, `error-other`, `ok` (a successful Claude web search, under host `(web-search)`), `ok-no-status` (Claude: fetched, no code recorded) or `no-status` (Codex page open, no code recorded). |
 | `compactions` | object | `count`, `auto`, `manual`, `unknown` |
@@ -190,6 +193,33 @@ An **Acc** is `{requests, tokens, priced_usd, unpriced_requests, long_context_re
 - `reasoning`.
 
 The classes `input`, the three cache writes, `cache_read` and `output` are disjoint, and their sum is the total. `reasoning` is a subset of `output`, never an extra class. Codex `input_tokens` includes cached input, so agentprof records `input = input_tokens − cached_input_tokens`.
+
+### Archive lookups
+
+`archive` measures whether agents use the archive's search tools or grep the archive. It is not a finding rule: it writes no finding.
+
+**Archive root.** Nothing is built in. The roots come from the first of these that is set:
+
+1. `--archive-root DIR`, which can repeat.
+2. `[agentprof] archive_roots`, a list.
+3. The directory of `[lab.archive] start` in `research.toml`. A project that uses lab's archive needs no agentprof setting.
+
+A root is absolute, or relative to the project root. A session that started outside the project root (a git worktree of the project) also matches a relative root under the directory it started in and under each directory above that one. Paths in `scan.json` show the home directory as `~`. `scan.json` records the roots and their origin in `archive.roots` and `archive.roots_basis`, with the totals over all sessions. Without a root, `greps`, `reads`, `search_share` and `grep_share` are null.
+
+| Field | Counts |
+|---|---|
+| `searches` | Shell commands `lab search`, `lab open`, `lab related` and `lab archive find`, and calls of tools named `archive_search`, `archive_open` or `archive_related` (the name after the last `__` or `.`, so any MCP server prefix matches). A command with `--help` or `-h` is not counted. |
+| `opens` | The `lab open` and `archive_open` calls among `searches`. |
+| `related` | The `lab related` and `archive_related` calls among `searches`. |
+| `no_hit_searches` | `lab search` and `lab archive find` commands that exited 1. The query must be the only command of the shell call apart from `cd` and `NAME=value` before it, so that the exit status is its own; a `cd` that fails with status 1 is then misread as no hit. Behind a pipe such as `\| head` the status is lost and nothing is counted. For Claude, the result text must start with `Exit code 1`. |
+| `greps` | Shell commands `grep`, `egrep`, `fgrep`, `rg`, `ag` and `git grep` with a path operand under a root, and Claude `Grep` calls whose `path` (default: the working directory) is under a root. Without a path operand, `rg`, `ag`, `git grep` and `grep -r` count when the working directory is under a root and the command does not read a pipe. A path above the root, such as `docs` for the root `docs/research`, is not counted. |
+| `reads` | The file reads of the `reads` field whose file is under a root. |
+| `search_share` | `searches / (searches + greps)`. Null when both are 0. |
+| `grep_share` | `greps / (searches + greps)`, which is 1 − `search_share`. Null when both are 0. |
+
+Each shell command counts once, so one `Bash` call with three greps counts three. Shell commands are read without running them: agentprof splits a command line at `;`, `&&`, `||`, `|`, `&`, newlines and parentheses, follows `cd DIR` and `NAME=value` with literal values, and skips here-document bodies, quoted text, comments and redirect targets. The first operand of a grep is its pattern unless `-e` or `-f` gives one. It does not expand globs, `~`, command substitutions or loop variables, and it does not see commands inside `xargs`, `find -exec` or `sh -c`, or behind a runner such as `uv run`, `timeout` or `sudo`. Of lab's options before the subcommand it knows `--config FILE`. `--help`, `--version`, `rg --files` and `rg --type-list` are not greps. Claude commands resolve against the working directory recorded with the call, Codex commands against the thread's working directory.
+
+Lab reads these as lesson metrics: `agentprof:session.archive.searches`, `agentprof:session.archive.greps`, `agentprof:session.archive.reads`, `agentprof:session.archive.search_share`, `agentprof:session.archive.grep_share`, `agentprof:session.archive.no_hit_searches`, `agentprof:session.archive.opens` and `agentprof:session.archive.related`. A null value leaves the session out, so the two shares cover only sessions with at least one lookup. Lab treats a lower value of a session field as better, so a lesson that should raise the use of search measures `grep_share` or `greps`, not `search_share`.
 
 ### Time
 
