@@ -804,51 +804,40 @@ fn archive_section(o: &mut String, a: &Value, sessions: &[Session], top: usize) 
         .filter_map(Value::as_str)
         .map(|r| format!("`{r}`"))
         .collect();
+    let lookup = "Columns are the session record's `archive` fields; lab reads each as `agentprof:session.archive.<field>`.";
+    let mut cols = vec![
+        ("Sessions", n("sessions")),
+        ("searches", n("searches")),
+        ("opens", n("opens")),
+        ("related", n("related")),
+        ("no_hit_searches", n("no_hit_searches")),
+    ];
     if roots.is_empty() {
         let _ = writeln!(
             o,
-            "No archive root is set, so `greps`, `reads`, `search_share` and `grep_share` are not counted. Set a root with `--archive-root DIR`, `[agentprof] archive_roots` or `[lab.archive] start` in `research.toml`. Columns are the session record's `archive` fields; lab reads each as `agentprof:session.archive.<field>`.\n"
+            "No archive root is set, so `greps`, `reads`, `search_share` and `grep_share` are not counted. Set a root with `--archive-root DIR`, `[agentprof] archive_roots` or `[lab.archive] start` in `research.toml`. {lookup}\n"
         );
+    } else {
         let _ = writeln!(
             o,
-            "| Sessions | searches | opens | related | no_hit_searches |"
+            "Archive roots: {} (from {}). {lookup} The shares are over `searches + greps`.\n",
+            roots.join(", "),
+            a["roots_basis"].as_str().unwrap_or("unknown")
         );
-        let _ = writeln!(o, "|---:|---:|---:|---:|---:|");
-        let _ = writeln!(
-            o,
-            "| {} | {} | {} | {} | {} |\n",
-            n("sessions"),
-            n("searches"),
-            n("opens"),
-            n("related"),
-            n("no_hit_searches")
-        );
+        cols.extend([
+            ("greps", n("greps")),
+            ("reads", n("reads")),
+            ("search_share", share(a["search_share"].as_f64())),
+            ("grep_share", share(a["grep_share"].as_f64())),
+        ]);
+    }
+    let row = |cells: Vec<&str>| format!("| {} |", cells.join(" | "));
+    let _ = writeln!(o, "{}", row(cols.iter().map(|c| c.0).collect()));
+    let _ = writeln!(o, "|{}", "---:|".repeat(cols.len()));
+    let _ = writeln!(o, "{}\n", row(cols.iter().map(|c| c.1.as_str()).collect()));
+    if roots.is_empty() {
         return;
     }
-    let _ = writeln!(
-        o,
-        "Archive roots: {} (from {}). Columns are the session record's `archive` fields; lab reads each as `agentprof:session.archive.<field>`. The shares are over `searches + greps`.\n",
-        roots.join(", "),
-        a["roots_basis"].as_str().unwrap_or("unknown")
-    );
-    let _ = writeln!(
-        o,
-        "| Sessions | searches | opens | related | no_hit_searches | greps | reads | search_share | grep_share |"
-    );
-    let _ = writeln!(o, "|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
-    let _ = writeln!(
-        o,
-        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
-        n("sessions"),
-        n("searches"),
-        n("opens"),
-        n("related"),
-        n("no_hit_searches"),
-        n("greps"),
-        n("reads"),
-        share(a["search_share"].as_f64()),
-        share(a["grep_share"].as_f64())
-    );
     let mut rows: Vec<_> = sessions
         .iter()
         .filter_map(|s| Some((s, s.archive.as_ref()?)))

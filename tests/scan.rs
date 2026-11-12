@@ -894,6 +894,19 @@ fn archive_lookups_are_counted_under_the_configured_root() {
     assert_eq!(s["archive"]["greps"], 1);
     assert_eq!(sj["archive"]["roots_basis"], "--archive-root");
 
+    // A root that no session grepped: the totals, and no top table.
+    let empty = base.join("empty-archive");
+    let (s, _) = run(&["--archive-root", empty.to_str().unwrap()]);
+    assert_eq!(s["archive"]["greps"], 0);
+    let md = report(&repo.join("out"));
+    assert!(
+        md.contains(
+            "| 1 | 5 | 1 | 1 | 1 | 0 | 0 | 100.0% | 0.0% |\n\nNo session grepped the archive.\n"
+        ),
+        "{md}"
+    );
+    assert!(!md.contains("sessions by archive greps"), "{md}");
+
     // A start page in the project root makes the project the root; an
     // absolute root is written with the home directory hidden.
     std::fs::write(
