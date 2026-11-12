@@ -235,8 +235,12 @@ fn resolve(a: &ScanArgs) -> Result<Inputs> {
         project: root.clone(),
         roots: archive_roots
             .iter()
-            .map(|r| normalise_root(r))
-            .map(|r| if r.is_empty() { ".".into() } else { r })
+            // An empty root (a start page in the project root) is the
+            // project root itself.
+            .map(|r| match r.as_str() {
+                "" => ".".to_string(),
+                r => normalise_root(r),
+            })
             .collect(),
     };
     let out = a
@@ -1157,7 +1161,7 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
         let reads = (!inp.archive.roots.is_empty())
             .then(|| known.iter().filter_map(|a| a.reads).sum::<u64>());
         json!({
-            "roots": inp.archive.roots,
+            "roots": inp.archive.roots.iter().map(|r| tilde(r)).collect::<Vec<_>>(),
             "roots_basis": inp.archive_basis,
             "sessions": known.len(),
             "searches": searches,

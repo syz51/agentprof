@@ -18,12 +18,21 @@ pub struct Config {
 impl Config {
     /// The absolute roots for a session that started in `base`: each
     /// relative root under the project root and, for a session that started
-    /// outside it (a git worktree of the project), under `base` as well.
+    /// outside it (a git worktree of the project), under `base` and each
+    /// directory above it as well, since the transcript does not say which
+    /// of them is the checkout's root.
     fn absolute(&self, base: Option<&str>) -> Vec<String> {
+        let mut dirs = vec![self.project.as_str()];
+        if let Some(b) = base.filter(|b| b.starts_with('/') && !within(b, &self.project)) {
+            let mut dir = b.trim_end_matches('/');
+            while !dir.is_empty() {
+                dirs.push(dir);
+                dir = dir.rsplit_once('/').map_or("", |(up, _)| up);
+            }
+        }
         let mut out = Vec::new();
-        let outside = base.filter(|b| b.starts_with('/') && !within(b, &self.project));
         for r in &self.roots {
-            for dir in [Some(self.project.as_str()), outside].into_iter().flatten() {
+            for dir in &dirs {
                 if let Some(p) = resolve_path(Some(dir), r)
                     && !out.contains(&p)
                 {
@@ -119,17 +128,19 @@ impl<'a> Counter<'a> {
     }
 
     /// Counts the lookups in a shell command run in `cwd`. True when the
-    /// command's last simple command is a query (`lab search`, `lab archive
-    /// find`), so the command's exit status 1 means "no hit".
+    /// command is one query (`lab search`, `lab archive find`) after nothing
+    /// but `cd` and assignments, so its exit status 1 means "no hit".
     pub fn shell(&mut self, cmd: &str, cwd: Option<&str>) -> bool {
         let mut sh = Shell {
             cwd: cwd.map(str::to_string),
             vars: HashMap::new(),
             last_is_query: false,
+            others: false,
+            subshells: Vec::new(),
             counter: self,
         };
         sh.run(cmd);
-        sh.last_is_query
+        sh.last_is_query && !sh.others
     }
 
     /// A query that exited 1: it found nothing.
@@ -158,6 +169,10 @@ struct Shell<'c, 'a> {
     cwd: Option<String>,
     vars: HashMap<String, String>,
     last_is_query: bool,
+    /// A command other than `cd` ran before the last one.
+    others: bool,
+    /// The working directories outside the open subshells.
+    subshells: Vec<Option<String>>,
     counter: &'c mut Counter<'a>,
 }
 
@@ -284,6 +299,14 @@ impl Shell<'_, '_> {
                 ';' | '(' | ')' => {
                     self.simple(lex.end_command(), piped);
                     piped = false;
+                    // A subshell's `cd` ends with it.
+                    if ch == '(' {
+                        self.subshells.push(self.cwd.clone());
+                    } else if ch == ')'
+                        && let Some(cwd) = self.subshells.pop()
+                    {
+                        self.cwd = cwd;
+                    }
                 }
                 '|' => {
                     let or = c.get(i) == Some(&'|');
@@ -327,8 +350,12 @@ impl Shell<'_, '_> {
                 }
                 '<' | '>' => {
                     // A redirect: drop a file-descriptor prefix and the target.
-                    lex.cur.clear();
-                    lex.in_word = false;
+                    if lex.cur.bytes().all(|b| b.is_ascii_digit()) {
+                        lex.cur.clear();
+                        lex.in_word = false;
+                    } else {
+                        lex.end_word();
+                    }
                     lex.redirect = true;
                     while c.get(i).is_some_and(|x| matches!(x, '<' | '>' | '&' | '|')) {
                         i += 1;
@@ -383,9 +410,13 @@ impl Shell<'_, '_> {
             }
             return;
         };
+        self.others |= self.last_is_query;
         self.last_is_query = false;
-        match prog.rsplit('/').next().unwrap_or(prog) {
+        let prog = prog.rsplit('/').next().unwrap_or(prog);
+        let before = std::mem::replace(&mut self.others, true);
+        match prog {
             "cd" => {
+                self.others = before;
                 self.cwd = match args {
                     [dir] if !dir.starts_with(['-', '~']) && !dir.contains('$') => {
                         resolve_path(self.cwd.as_deref(), dir)
@@ -397,7 +428,12 @@ impl Shell<'_, '_> {
                 if args.iter().any(|a| a == "--help" || a == "-h") {
                     return;
                 }
-                let mut sub = args.iter().filter(|a| !a.starts_with('-'));
+                // `--config FILE` is lab's one option with a separate value.
+                let mut config = false;
+                let mut sub = args.iter().filter(|a| {
+                    let value = std::mem::replace(&mut config, a.as_str() == "--config");
+                    !value && !a.starts_with('-')
+                });
                 let lookup = match sub.next().map(String::as_str) {
                     Some("search") => Some(Lookup::Query),
                     Some("open") => Some(Lookup::Open),
@@ -410,6 +446,7 @@ impl Shell<'_, '_> {
                 if let Some(l) = lookup {
                     self.counter.lookup(l);
                     self.last_is_query = l == Lookup::Query;
+                    self.others = before;
                 }
             }
             "grep" | "egrep" | "fgrep" => self.grep(args, "dD", Some('r'), piped),
@@ -480,6 +517,15 @@ impl Shell<'_, '_> {
             "--file-search-regex",
             "--ignore",
         ];
+        // Invocations that search nothing.
+        if args.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "--help" | "--version" | "--files" | "--type-list"
+            )
+        }) {
+            return;
+        }
         let mut pattern_given = false;
         let mut recursive = recursive_flag.is_none();
         let mut operands: Vec<&str> = Vec::new();
@@ -587,12 +633,13 @@ mod tests {
                 "cd /work/proj && lab archive find H164 2>&1 | head",
                 "lab open DR041#summary; lab related DR041",
                 "/usr/local/bin/lab search x",
+                "lab --config /x/research.toml search x",
                 // Not lookups.
                 "lab archive find --help",
                 "lab archive update && lab check",
                 "echo lab search x",
             ]),
-            (5, 1, 1, 0)
+            (6, 1, 1, 0)
         );
     }
 
@@ -652,6 +699,17 @@ mod tests {
         assert_eq!(greps("LC_ALL=C grep -n x docs/research/a.md"), 1);
         assert_eq!(greps("cd \"$X\" && grep -rn x docs/research"), 0);
         assert_eq!(greps("cd docs/research && grep -n x ~/notes.md"), 0);
+        // A subshell's cd ends at its closing parenthesis.
+        assert_eq!(greps("(cd docs/research && ls); rg x"), 0);
+        assert_eq!(greps("(cd docs/research && rg x); rg y"), 1);
+        assert_eq!(greps("(cd src && ls) && grep x docs/research/a.md"), 1);
+        // Invocations that search nothing.
+        assert_eq!(greps("cd docs/research && rg --files"), 0);
+        assert_eq!(greps("rg --files docs/research"), 0);
+        assert_eq!(greps("cd docs/research && git grep --help"), 0);
+        // A redirect joined to a path operand.
+        assert_eq!(greps("grep -n x docs/research/a.md>/dev/null 2>&1"), 1);
+        assert_eq!(greps("grep -n x src/a.md 2>docs/research/err"), 0);
         assert_eq!(greps("cd ~/elsewhere && grep -rn x docs/research"), 0);
         // A relative path without a working directory resolves nowhere.
         let c = cfg();
@@ -697,6 +755,21 @@ mod tests {
         let a = k.finish();
         assert_eq!((a.greps, a.reads), (Some(4), Some(1)));
         assert_eq!(a.search_share, Some(0.0));
+        // A session that started below its checkout's root.
+        let mut k = Counter::new(&c);
+        k.see_cwd("/wt/proj-2/crates/x");
+        k.read("/wt/proj-2/docs/research/START.md");
+        k.read("/other/docs/research/START.md");
+        assert_eq!(k.finish().reads, Some(1));
+        // A root that is the project root itself.
+        let c = Config {
+            project: "/work/proj".into(),
+            roots: vec![".".into()],
+        };
+        let mut k = Counter::new(&c);
+        k.read("/work/proj/a.md");
+        k.read("/work/other/a.md");
+        assert_eq!(k.finish().reads, Some(1));
     }
 
     #[test]
@@ -713,16 +786,20 @@ mod tests {
         assert!(!k.shell("lab search x | head", None));
         assert!(!k.shell("lab open DR1", None));
         assert!(!k.shell("lab search x; false", None));
+        // Another command before the query can set the exit status.
+        assert!(!k.shell("false; lab search x", None));
+        assert!(!k.shell("lab search x; lab search y", None));
+        assert!(k.shell("M=/work/proj; cd $M && lab search x", None));
         k.no_hit();
         k.shell("grep x /work/proj/docs/research/a", None);
         let a = k.finish();
         assert_eq!(
             (a.searches, a.opens, a.related, a.no_hit_searches),
-            (8, 2, 1, 1)
+            (12, 2, 1, 1)
         );
         assert_eq!(a.greps, Some(1));
-        assert_eq!(a.search_share, Some(8.0 / 9.0));
-        assert_eq!(a.grep_share, Some(1.0 / 9.0));
+        assert_eq!(a.search_share, Some(12.0 / 13.0));
+        assert_eq!(a.grep_share, Some(1.0 / 13.0));
     }
 
     #[test]

@@ -848,6 +848,17 @@ fn archive_lookups_are_counted_under_the_configured_root() {
     assert_eq!(s["archive"]["greps"], 1);
     assert_eq!(sj["archive"]["roots_basis"], "--archive-root");
 
+    // A start page in the project root makes the project the root; an
+    // absolute root is written with the home directory hidden.
+    std::fs::write(
+        repo.join("research.toml"),
+        "[agentprof]\nout = \"out\"\n[lab.archive]\nstart = \"START.md\"\n",
+    )
+    .unwrap();
+    let (s, sj) = run(&[]);
+    assert_eq!(sj["archive"]["roots"], serde_json::json!(["."]));
+    assert_eq!(s["archive"]["reads"], 3);
+
     // Without a root the searches are counted and the rest is unknown.
     std::fs::write(repo.join("research.toml"), "[agentprof]\nout = \"out\"\n").unwrap();
     let (s, sj) = run(&[]);
