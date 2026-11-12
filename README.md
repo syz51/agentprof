@@ -48,6 +48,8 @@ agentprof scan --project /work/thesis --out ./profile \
 | `findings.jsonl` | One `rf.finding/1` record per finding. |
 | `scan.json` | `agentprof.scan/1`: inputs, coverage, cross-checks, active-time unions, thresholds and the pricing used. |
 
+`scan` writes all three files to hidden temporary names in `--out` first, then renames them into place, `scan.json` last. A scan that stops while writing leaves the previous scan's files whole. A process killed during the write can leave a hidden `.<file>.<pid>.tmp` file, which is safe to delete. `report` refuses files whose session or finding counts differ from those in `scan.json`, since such files come from different scans.
+
 Stdout gets a short text summary. With `--format jsonl`, it gets the findings instead.
 
 Flags:
@@ -176,7 +178,7 @@ One JSON object per line. The fields:
 | `api_errors` | map | API error kind, then count. |
 | `rate_limits` | object | `observations`, `max_used_percent`, `saturated_observations` (≥ 100 %), `limit_reached_observations`, `limit_errors` (refused Claude requests), `limit_types` |
 | `cost` | object | `usd` (null if any request is unpriced), `priced_usd`, `unpriced_requests`, `unpriced_models`, `server_tool_usd`, `basis` |
-| `billing` | object | `mode`: `subscription`, `api`, `refused` or `unknown`. Also `basis` and `plan_type`. |
+| `billing` | object | `mode`: `subscription`, `api`, `passthrough` (Claude: the router left the run's settings alone) or `unknown`. Also `basis` and `plan_type`. |
 | `claude_code_cost_usd` | number or null | Claude Code's own cost counter. Reported, never used. |
 | `transcript` | object or null | `path` (Codex: the newest segment), `status` (`present`, `zstd`, `missing`; Codex also `damaged` or `incomplete`, when the recorded newest segment is missing but earlier ones exist), `lines`, `bad_lines`, `inherited_lines`; `segments` (Codex: every segment file read, oldest first, when there are several or the recorded newest one is missing) and `error` (the read error of a damaged transcript). |
 | `t3` | object or null | T3 threads only. `project_id`, `provider`, `runs_by_status`, `runs_by_model`, `runs_by_effort`, `runs_by_provider` (the run's own provider, then status), `archived`, `deleted`, `linked` (`<source>:<id>`), `link_basis`, `unresolved_links`. |
@@ -245,7 +247,7 @@ When Codex records no tier, standard is assumed and a note says so.
 
 ### Billing mode
 
-- **Claude:** the latest decision in the billing log made for the same directory at most 120 s before the session's first record. Otherwise the mode is `unknown`. A subagent inherits its session's mode, with a basis that says so; only a subagent whose session is not in the scan is looked up by its own first record.
+- **Claude:** the latest decision in the billing log made for the same directory at most 120 s before the session's first record. Otherwise the mode is `unknown`. A decision is a line whose `mode` is `api`, `subscription` or `passthrough`. The log's `refused` lines (written after a refused run) and `cost` lines describe a run that already started, so they never set a mode; `coverage.billing.other_lines` counts them, and `bad_lines` counts lines that do not parse or have another mode. A subagent inherits its session's mode, with a basis that says so; only a subagent whose session is not in the scan is looked up by its own first record.
 - **Codex:** `subscription` when the rollout's rate-limit snapshots carry a `plan_type`. Otherwise the mode is `unknown`.
 
 ### T3 linkage

@@ -171,6 +171,18 @@ pub fn render(dir: &Path, top: usize) -> Result<String> {
             serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
         check_schema(v["schema"].as_str(), crate::scan::SCAN_SCHEMA)
             .with_context(|| p.display().to_string())?;
+        // The three files must come from one scan. A scan replaces them in
+        // a short run of renames, so a stop there could leave a mix.
+        for (field, n) in [("sessions", sessions.len()), ("findings", findings.len())] {
+            if let Some(want) = v[field].as_u64()
+                && want != n as u64
+            {
+                bail!(
+                    "{} lists {want} {field} but {field}.jsonl has {n}: the files are from different scans; run agentprof scan again",
+                    p.display()
+                );
+            }
+        }
         v
     };
     let mut o = String::new();

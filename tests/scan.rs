@@ -1157,4 +1157,12 @@ fn report_rejects_other_schema_majors_and_survives_a_closed_pipe() {
         err.contains("sessions.jsonl:1") && err.contains("rf.session/2"),
         "{err}"
     );
+
+    // Files from different scans (here: one session fewer) are refused.
+    let first = text.lines().next().unwrap();
+    std::fs::write(&path, format!("{first}\n")).unwrap();
+    let mixed = Command::new(bin).arg("report").arg(&out).output().unwrap();
+    assert_eq!(mixed.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&mixed.stderr);
+    assert!(err.contains("different scans"), "{err}");
 }
