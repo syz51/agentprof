@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rusqlite::{Connection, params};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const SECRET_PROMPT: &str = "SECRET-PROMPT-TEXT";
 const SECRET_OUTPUT: &str = "SECRET-TOOL-OUTPUT";
@@ -1244,4 +1244,133 @@ fn report_rejects_other_schema_majors_and_survives_a_closed_pipe() {
     assert_eq!(mixed.status.code(), Some(2));
     let err = String::from_utf8_lossy(&mixed.stderr);
     assert!(err.contains("different scans"), "{err}");
+}
+
+/// A `thread:subagent:<hash>` child thread names its native subagent only in
+/// its `forkedFrom` node; a model without a price row is counted as unpriced.
+#[test]
+fn native_subagent_thread_links_by_its_fork_node_and_unpriced_requests_are_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let claude = claude_tree(root);
+    std::fs::write(
+        claude.join("-work-proj/s2.jsonl"),
+        r#"{"type":"assistant","uuid":"c1","requestId":"q1","sessionId":"s2","cwd":"/work/proj","timestamp":"2026-01-05T00:00:00Z","message":{"id":"n1","model":"claude-nonesuch-9","content":[],"usage":{"input_tokens":5,"output_tokens":1}}}
+{"type":"assistant","uuid":"c2","requestId":"q2","sessionId":"s2","cwd":"/work/proj","timestamp":"2026-01-05T00:00:01Z","message":{"id":"n2","model":"claude-fable-5-2","content":[],"usage":{"input_tokens":1000000,"output_tokens":0}}}
+"#,
+    )
+    .unwrap();
+    let t3 = t3_db(root);
+    let c = Connection::open(&t3).unwrap();
+    let child = |id: &str, agent: &str| {
+        let payload = format!(
+            r#"{{"lineage":{{"parentThreadId":"T-a","relationshipToParent":"subagent"}},"forkedFrom":{{"type":"node","nodeId":"node:provider:claudeAgent:native-item:task%3A{agent}"}}}}"#
+        );
+        c.execute(
+            "insert into orchestration_v2_projection_threads values (?1, 'p1', 't', 'claudeAgent', '2026-01-01T00:00:05Z', '2026-01-01T00:00:06Z', null, null, ?2)",
+            params![id, payload],
+        )
+        .unwrap();
+    };
+    child("thread:subagent:0123456789abcdef", "a7");
+    child("thread:subagent:fedcba9876543210", "gone1");
+    // A user's fork at the same node, and payloads of an unexpected shape:
+    // none links, and the lineage of the last one is still read.
+    for (id, payload) in [
+        (
+            "T-fork",
+            r#"{"lineage":{"parentThreadId":"T-a","relationshipToParent":"fork"},"forkedFrom":{"type":"node","nodeId":"node:provider:claudeAgent:native-item:task%3Aa7"}}"#,
+        ),
+        (
+            "T-odd",
+            r#"{"lineage":{"parentThreadId":"T-a","relationshipToParent":"subagent"},"forkedFrom":"T-a"}"#,
+        ),
+    ] {
+        c.execute(
+            "insert into orchestration_v2_projection_threads values (?1, 'p1', 't', 'claudeAgent', '2026-01-01T00:00:05Z', '2026-01-01T00:00:06Z', null, null, ?2)",
+            params![id, payload],
+        )
+        .unwrap();
+    }
+    drop(c);
+    let out = root.join("out");
+    let res = scan(
+        root,
+        &[
+            "--project",
+            "/work/proj",
+            "--claude-dir",
+            claude.to_str().unwrap(),
+            "--codex-db",
+            "/nonexistent/state.sqlite",
+            "--t3-db",
+            t3.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        res.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let rows = read_jsonl(&out.join("sessions.jsonl"));
+    let linked = session(&rows, "t3:thread:subagent:0123456789abcdef");
+    assert_eq!(linked["t3"]["link_basis"], "agent-ref");
+    assert_eq!(linked["t3"]["linked"], json!(["claude:s1/agent-a7"]));
+    let lost = session(&rows, "t3:thread:subagent:fedcba9876543210");
+    assert_eq!(lost["t3"]["link_basis"], "none");
+    assert_eq!(
+        lost["t3"]["unresolved_links"],
+        json!(["claude:agent-gone1"])
+    );
+
+    let findings = read_jsonl(&out.join("findings.jsonl"));
+    let unlinked = |subject: &str| {
+        findings
+            .iter()
+            .find(|f| f["rule"] == "t3-unlinked" && f["subject"] == subject)
+            .cloned()
+    };
+    assert!(unlinked("t3:thread:subagent:0123456789abcdef").is_none());
+    let f = unlinked("t3:thread:subagent:fedcba9876543210").unwrap();
+    assert_eq!(f["data"]["cause"], "native-session-not-found");
+    assert!(
+        f["message"]
+            .as_str()
+            .unwrap()
+            .contains("claude:agent-gone1")
+    );
+    assert_eq!(unlinked("t3:T-e").unwrap()["data"]["cause"], "no-reference");
+    for t in ["t3:T-fork", "t3:T-odd"] {
+        assert_eq!(
+            unlinked(t).unwrap()["data"]["cause"],
+            "no-runs-no-reference",
+            "{t}"
+        );
+    }
+    assert_eq!(session(&rows, "t3:T-odd")["role"], "subagent");
+
+    // One request of s2 has no price row; the other is priced from the
+    // claude-fable-5-2 row: 1M input tokens at 8 USD.
+    let s2 = session(&rows, "claude:s2");
+    assert_eq!(s2["cost"]["usd"], Value::Null);
+    assert_eq!(s2["cost"]["priced_usd"], 8.0);
+    assert_eq!(s2["cost"]["unpriced_models"], json!(["claude-nonesuch-9"]));
+    let cost = &scan_json(&out)["cost"];
+    assert_eq!(cost["unpriced_requests"], 1);
+    assert_eq!(cost["unpriced_sessions"], 1);
+    assert_eq!(
+        cost["unpriced_requests_by_model"],
+        json!({"claude-nonesuch-9": 1})
+    );
+    let text = String::from_utf8(res.stdout).unwrap();
+    let requests = cost["requests"].as_u64().unwrap();
+    assert!(
+        text.contains(&format!(
+            "  unpriced: 1 of {requests} request(s) in 1 session(s) have no cost (claude-nonesuch-9 1)"
+        )),
+        "{text}"
+    );
 }

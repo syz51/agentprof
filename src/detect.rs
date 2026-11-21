@@ -708,13 +708,36 @@ pub fn per_session(s: &Session, t: &Trace, cx: &Ctx) -> Vec<Finding> {
             ));
         }
         if t3.linked.is_empty() {
+            let runs = t3.runs_by_status.values().sum::<u64>();
+            let (cause, why) = if !t3.unresolved_links.is_empty() {
+                (
+                    "native-session-not-found",
+                    format!(
+                        "T3 names {}, which the scan did not find",
+                        t3.unresolved_links.join(", ")
+                    ),
+                )
+            } else if runs == 0 {
+                (
+                    "no-runs-no-reference",
+                    "T3 recorded no run and no reference to a native session for it".to_string(),
+                )
+            } else {
+                (
+                    "no-reference",
+                    "T3 recorded no thread or agent reference for it, and no turn reference matched"
+                        .to_string(),
+                )
+            };
             out.push(cx.finding(
                 "t3-unlinked",
                 "info",
                 &subject,
-                "the T3 thread could not be linked to a native Claude or Codex session".to_string(),
+                format!(
+                    "the T3 thread could not be linked to a native Claude or Codex session: {why}"
+                ),
                 Vec::new(),
-                json!({"runs": t3.runs_by_status.values().sum::<u64>()}),
+                json!({"runs": runs, "cause": cause, "unresolved_links": t3.unresolved_links}),
             ));
         }
     }
