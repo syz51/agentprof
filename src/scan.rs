@@ -1173,6 +1173,23 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             "grep_share": greps.and_then(|g| ratio(g, searches + g)),
         })
     };
+    // Requests without a cost, over every session with tokens. A T3 thread
+    // has none of its own, so nothing is counted twice.
+    let mut requests = 0u64;
+    let mut unpriced_requests = 0u64;
+    let mut unpriced_sessions = 0u64;
+    let mut unpriced_by_model = BTreeMap::<&str, u64>::new();
+    for s in &sessions {
+        let Some(total) = &s.total else { continue };
+        requests += total.requests;
+        unpriced_requests += total.unpriced_requests;
+        unpriced_sessions += u64::from(total.unpriced_requests > 0);
+        for (m, acc) in &s.by_model {
+            if acc.unpriced_requests > 0 {
+                *unpriced_by_model.entry(m.as_str()).or_default() += acc.unpriced_requests;
+            }
+        }
+    }
     let scan = json!({
         "schema": SCAN_SCHEMA,
         "tool": "agentprof",
@@ -1200,6 +1217,12 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             "all_sources": union_all,
             "basis": "union of the sessions' turn intervals (claude, codex) or run intervals (t3), so concurrent sessions are not double counted",
             "sessions_with_unknown_active_time": active_unknown,
+        },
+        "cost": {
+            "requests": requests,
+            "unpriced_requests": unpriced_requests,
+            "unpriced_sessions": unpriced_sessions,
+            "unpriced_requests_by_model": unpriced_by_model,
         },
         "sessions": sessions.len(),
         "findings": findings.len(),
@@ -1237,6 +1260,17 @@ pub fn run(a: &ScanArgs) -> Result<Outcome> {
             let mut by_rule = BTreeMap::<&str, u64>::new();
             for fd in &findings {
                 *by_rule.entry(fd.rule.as_str()).or_default() += 1;
+            }
+            if unpriced_requests > 0 {
+                let models: Vec<String> = unpriced_by_model
+                    .iter()
+                    .map(|(m, n)| format!("{m} {n}"))
+                    .collect();
+                writeln!(
+                    out,
+                    "  unpriced: {unpriced_requests} of {requests} request(s) in {unpriced_sessions} session(s) have no cost ({}); the cost of those sessions is unknown",
+                    models.join(", ")
+                )?;
             }
             writeln!(out, "  findings: {} ({} error)", findings.len(), errors)?;
             for (k, v) in by_rule {

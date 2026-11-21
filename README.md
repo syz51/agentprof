@@ -46,7 +46,7 @@ agentprof scan --project /work/thesis --out ./profile \
 |---|---|
 | `sessions.jsonl` | One `rf.session/1` record per session, sorted by source and id. |
 | `findings.jsonl` | One `rf.finding/1` record per finding. |
-| `scan.json` | `agentprof.scan/1`: inputs, coverage, cross-checks, active-time unions, thresholds and the pricing used. |
+| `scan.json` | `agentprof.scan/1`: inputs, coverage, cross-checks, active-time unions, thresholds, the pricing used and the count of unpriced requests. |
 
 `scan` writes all three files to hidden temporary names in `--out` first, then renames them into place, `scan.json` last. A scan that stops while writing leaves the previous scan's files whole. A process killed during the write can leave a hidden `.<file>.<pid>.tmp` file, which is safe to delete. `report` refuses files whose session or finding counts differ from those in `scan.json`, since such files come from different scans.
 
@@ -244,6 +244,8 @@ Cost is an **API-equivalent estimate**: what the counted tokens would cost at th
 - A cache write has an unknown TTL.
 - Codex reports a service tier other than `default`.
 
+`scan.json` `cost` counts them over the whole scan: `requests`, `unpriced_requests`, `unpriced_sessions` and `unpriced_requests_by_model`. When any request is unpriced, the text summary of `scan` prints the same counts in an `unpriced:` line.
+
 When Codex records no tier, standard is assumed and a note says so.
 
 ### Billing mode
@@ -256,7 +258,7 @@ When Codex records no tier, standard is assumed and a note says so.
 Each T3 thread is linked to the native sessions it drove. The link bases, from strongest to weakest:
 
 1. `thread-ref`: the provider thread reference.
-2. `agent-ref`: the provider-native Claude subagent id.
+2. `agent-ref`: the provider-native Claude subagent id. It comes from the thread id, or from the `forkedFrom` node of a `thread:subagent:<hash>` child thread (`node:provider:claudeAgent:native-item:task%3A<agent id>`).
 3. `turn-ref`: provider turn ids matched against Codex turn ids or Claude message uuids.
 
 T3 threads carry no tokens, so linking never adds tokens. `coverage.t3` reports linked and unlinked threads, and native sessions with and without a T3 thread.
@@ -301,7 +303,7 @@ T3 threads carry no tokens, so linking never adds tokens. `coverage.t3` reports 
 | `transcript-missing` | warn | A Codex rollout file no longer exists. | none |
 | `run-failed` | warn | T3 runs failed. | none |
 | `run-interrupted` | info | T3 runs were interrupted, cancelled or rolled back. | none |
-| `t3-unlinked` | info | A T3 thread links to no native session. | none |
+| `t3-unlinked` | info | A T3 thread links to no native session. The message and `data.cause` give the cause: `native-session-not-found` (T3 names a session, in `data.unresolved_links`, that the scan did not find), `no-runs-no-reference` (the thread has no run and names no session) or `no-reference` (the thread has runs but names no session). | none |
 | `subagent-fanout` | info | A session has at least N direct child sessions. A Claude subagent started by another subagent is that subagent's child (`coverage.claude.subagent_parent_nested`), not the session's. | `--fanout-min` (5) |
 | `subagent-token-share` | info | The share of a source's tokens spent in subagents. Always reported, once per source. | none |
 

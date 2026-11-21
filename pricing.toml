@@ -91,6 +91,19 @@ output = 2.50
 
 [[model]]
 provider = "anthropic"
+model = "claude-fable-5-2"
+input = 8.00
+cache_write_5m = 10.00
+cache_write_1h = 16.00
+cache_read = 0.20
+output = 40.00
+context_window = 1000000
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+checked = "2026-11-21"
+notes = "Global inference. inference_geo=us applies 1.1x (applied per request). Fast mode ($16/$80) is not priced here: fast requests are unpriced. The page lists no long-context tier for this model."
+
+[[model]]
+provider = "anthropic"
 model = "claude-fable-5-1"
 input = 10.00
 cache_write_5m = 12.50

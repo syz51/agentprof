@@ -105,9 +105,35 @@ pub fn links_in_id(id: &str) -> Vec<Link> {
     }]
 }
 
+/// The link in the `forkedFrom` node of a T3 child thread that a
+/// provider-native Claude subagent made:
+/// `node:provider:claudeAgent:native-item:task%3A<agent id>`. The thread's
+/// own id (`thread:subagent:<hash>`) names no native session, and the thread
+/// has no provider thread and no run.
+pub fn link_in_fork_node(node: &str) -> Option<Link> {
+    let rest = node.strip_prefix("node:provider:")?;
+    let (driver, item) = rest.split_once(":native-item:")?;
+    if source_of(driver.split(':').next()?) != Some("claude") {
+        return None;
+    }
+    let item = percent_decode(item);
+    let aid = item.strip_prefix("task:")?;
+    (!aid.is_empty() && aid.bytes().all(|c| c.is_ascii_alphanumeric())).then(|| Link::ClaudeAgent {
+        id: aid.to_string(),
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct ForkedFrom {
+    #[serde(rename = "nodeId")]
+    node_id: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 struct ThreadPayload {
     lineage: Option<Lineage>,
+    #[serde(rename = "forkedFrom")]
+    forked_from: Option<ForkedFrom>,
     #[serde(rename = "creationSource")]
     creation_source: Option<String>,
     #[serde(rename = "activeProviderThreadId")]
@@ -375,6 +401,14 @@ pub fn load(
         if let Some(a) = &row.payload.active_provider_thread_id {
             links.extend(links_in_id(a));
         }
+        if let Some(n) = row
+            .payload
+            .forked_from
+            .as_ref()
+            .and_then(|f| f.node_id.as_deref())
+        {
+            links.extend(link_in_fork_node(n));
+        }
         let pts: Vec<(String, Option<String>)> = pt_st
             .query_map([&row.id], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -498,5 +532,25 @@ mod tests {
                 id: "af6bb09e".into()
             }]
         );
+    }
+
+    #[test]
+    fn fork_node_of_a_native_subagent_decodes_to_its_agent() {
+        assert_eq!(
+            link_in_fork_node("node:provider:claudeAgent:native-item:task%3Aa6af417d60c562365"),
+            Some(Link::ClaudeAgent {
+                id: "a6af417d60c562365".into()
+            })
+        );
+        // Another driver, another item kind, or an id that is no agent id.
+        for n in [
+            "node:provider:codex:native-item:task%3Aa6af",
+            "node:provider:claudeAgent:native-item:tool%3Aa6af",
+            "node:provider:claudeAgent:native-item:task%3A",
+            "node:provider:claudeAgent:native-item:task%3A..%2Fx",
+            "node:run:r1",
+        ] {
+            assert_eq!(link_in_fork_node(n), None, "{n}");
+        }
     }
 }
