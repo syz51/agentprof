@@ -303,7 +303,7 @@ T3 threads carry no tokens, so linking never adds tokens. `coverage.t3` reports 
 | `transcript-missing` | warn | A Codex rollout file no longer exists. | none |
 | `run-failed` | warn | T3 runs failed. | none |
 | `run-interrupted` | info | T3 runs were interrupted, cancelled or rolled back. | none |
-| `t3-unlinked` | info | A T3 thread links to no native session. The message and `data.cause` give the cause: `native-session-not-found` (T3 names a session, in `data.unresolved_links`, that the scan did not find), `no-runs-no-reference` (the thread has no run and names no session) or `no-reference` (the thread has runs but names no session). | none |
+| `t3-unlinked` | info | A T3 thread links to no native session. The message and `data.cause` give the cause: `native-session-not-found` (T3 names a session, in `data.unresolved_links`, that the scan did not find), `no-runs-no-reference` (the thread has no run and names no session) or `no-reference` (the thread has runs, names no thread or agent, and no turn reference matched; unmatched turn ids are not listed). | none |
 | `subagent-fanout` | info | A session has at least N direct child sessions. A Claude subagent started by another subagent is that subagent's child (`coverage.claude.subagent_parent_nested`), not the session's. | `--fanout-min` (5) |
 | `subagent-token-share` | info | The share of a source's tokens spent in subagents. Always reported, once per source. | none |
 

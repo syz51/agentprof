@@ -1274,6 +1274,24 @@ fn native_subagent_thread_links_by_its_fork_node_and_unpriced_requests_are_count
     };
     child("thread:subagent:0123456789abcdef", "a7");
     child("thread:subagent:fedcba9876543210", "gone1");
+    // A user's fork at the same node, and payloads of an unexpected shape:
+    // none links, and the lineage of the last one is still read.
+    for (id, payload) in [
+        (
+            "T-fork",
+            r#"{"lineage":{"parentThreadId":"T-a","relationshipToParent":"fork"},"forkedFrom":{"type":"node","nodeId":"node:provider:claudeAgent:native-item:task%3Aa7"}}"#,
+        ),
+        (
+            "T-odd",
+            r#"{"lineage":{"parentThreadId":"T-a","relationshipToParent":"subagent"},"forkedFrom":"T-a"}"#,
+        ),
+    ] {
+        c.execute(
+            "insert into orchestration_v2_projection_threads values (?1, 'p1', 't', 'claudeAgent', '2026-01-01T00:00:05Z', '2026-01-01T00:00:06Z', null, null, ?2)",
+            params![id, payload],
+        )
+        .unwrap();
+    }
     drop(c);
     let out = root.join("out");
     let res = scan(
@@ -1325,6 +1343,14 @@ fn native_subagent_thread_links_by_its_fork_node_and_unpriced_requests_are_count
             .contains("claude:agent-gone1")
     );
     assert_eq!(unlinked("t3:T-e").unwrap()["data"]["cause"], "no-reference");
+    for t in ["t3:T-fork", "t3:T-odd"] {
+        assert_eq!(
+            unlinked(t).unwrap()["data"]["cause"],
+            "no-runs-no-reference",
+            "{t}"
+        );
+    }
+    assert_eq!(session(&rows, "t3:T-odd")["role"], "subagent");
 
     // One request of s2 has no price row; the other is priced from the
     // claude-fable-5-2 row: 1M input tokens at 8 USD.

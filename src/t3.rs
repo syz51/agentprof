@@ -124,16 +124,11 @@ pub fn link_in_fork_node(node: &str) -> Option<Link> {
 }
 
 #[derive(Deserialize, Default)]
-struct ForkedFrom {
-    #[serde(rename = "nodeId")]
-    node_id: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
 struct ThreadPayload {
     lineage: Option<Lineage>,
+    /// Untyped: an unexpected shape must not discard the rest of the payload.
     #[serde(rename = "forkedFrom")]
-    forked_from: Option<ForkedFrom>,
+    forked_from: Option<serde_json::Value>,
     #[serde(rename = "creationSource")]
     creation_source: Option<String>,
     #[serde(rename = "activeProviderThreadId")]
@@ -401,11 +396,19 @@ pub fn load(
         if let Some(a) = &row.payload.active_provider_thread_id {
             links.extend(links_in_id(a));
         }
-        if let Some(n) = row
+        // Only a subagent child: a user's fork of a thread at a subagent's
+        // node did not drive that subagent.
+        let is_subagent = row
             .payload
-            .forked_from
+            .lineage
             .as_ref()
-            .and_then(|f| f.node_id.as_deref())
+            .is_some_and(|l| l.relationship.as_deref() == Some("subagent"));
+        if is_subagent
+            && let Some(n) = row
+                .payload
+                .forked_from
+                .as_ref()
+                .and_then(|f| f.get("nodeId")?.as_str())
         {
             links.extend(link_in_fork_node(n));
         }
